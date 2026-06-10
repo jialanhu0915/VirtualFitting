@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from virtual_tryon import ClothingDetector, Keypoint, RobustHumanDetector
+from virtual_tryon.human_detector import set_debug_dir as set_human_debug
+from virtual_tryon.clothing_detector import set_debug_dir as set_clothing_debug
 from virtual_tryon.io import ensure_dir, load_image, save_image
 from virtual_tryon.visualize import draw_keypoints
 
@@ -40,6 +42,11 @@ def cmd_detect(args: argparse.Namespace) -> int:
     person_img = load_image(args.person)
     clothing_img = load_image(args.clothing, with_alpha=True)
 
+    out_dir = ensure_dir(args.output)
+    debug_dir = ensure_dir(out_dir / "debug")
+    set_human_debug(debug_dir)
+    set_clothing_debug(debug_dir)
+
     human_det = RobustHumanDetector()
     clothing_det = ClothingDetector()
 
@@ -48,7 +55,10 @@ def cmd_detect(args: argparse.Namespace) -> int:
     logger.info("正在检测服装关键点：%s", args.clothing)
     clothing_kpts = clothing_det.detect(clothing_img)
 
-    out_dir = ensure_dir(args.output)
+    # 检测结束，关掉调试写入，避免后续画图再次落盘。
+    set_human_debug(None)
+    set_clothing_debug(None)
+
     save_image(
         out_dir / "human_keypoints.jpg",
         draw_keypoints(person_img, human_kpts),

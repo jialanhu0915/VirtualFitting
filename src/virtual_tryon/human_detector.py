@@ -22,6 +22,7 @@ from mediapipe.tasks.python import vision as mp_vision
 # 若环境确实没装 mediapipe，本文件加载会失败——这是有意的，避免无意义地降级到
 # 精度很低的 Haar 路径。
 from .keypoints import Keypoint, MEDIAPIPE_POSE_INDICES
+from .visualize import draw_keypoints
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,17 @@ logger = logging.getLogger(__name__)
 # 向上三级即为仓库根目录，模型缓存到根目录的 models/ 下。
 _MODELS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "models"
 _MODEL_PATH: Path = _MODELS_DIR / "pose_landmarker_full.task"
+
+# 调试目录：默认指向一个永远不存在的占位路径，未通过 set_debug_dir() 启用时
+# 所有 imwrite 调用都被短路；用 Path 而不是 None 是为了让 Pyright 在所有
+# 调用点都不需要 None 守卫。
+_DEBUG_DIR: Path = Path("/__virtual_tryon_debug_disabled__")
+
+
+def set_debug_dir(path: Path | None) -> None:
+    """设置中间产物输出目录。None 表示关闭调试输出。"""
+    global _DEBUG_DIR
+    _DEBUG_DIR = path if path is not None else Path("/__virtual_tryon_debug_disabled__")
 # MediaPipe 官方公共存储，提供 MediaPipe Solutions / Tasks API 的模型权重。
 # 使用 full 模型而非 lite：full 在长袖/交叉臂/侧身姿态下识别更稳定，
 # lite 在这些场景会出现左右镜像翻转。模型约 12MB。
@@ -120,6 +132,35 @@ class MediaPipeHumanDetector(HumanDetector):
                 name=name,
             )
 
+        # MediaPipe Pose 的 left/right 是 subject 解剖学的左右，与图像坐标轴的
+        # 左右没有固定关系——取决于相机是否水平翻转（自拍模式会把 subject 的
+        # 右侧映射到图像左侧）。因此 MediaPipe 原始输出可能"看起来左右反了"，
+        # 但命名（left/right）始终对应 subject 解剖学方向。
+        #
+        # 历史教训：之前在这里加了"自动水平翻转"逻辑，把对的输出翻成了错的。
+        # MediaPipe Pose full 模型对新模特的输出已经是正确的，不再做任何翻转。
+        if (
+            "right_eye" in out
+            and "left_eye" in out
+            and out["right_eye"].x < out["left_eye"].x
+        ):
+            logger.warning(
+                "MediaPipe 输出在图像坐标上看似镜像（right_eye 在左）；"
+                "这是相机水平翻转（自拍）导致的，是正确信号，不再做自动翻转。"
+            )
+
+        # 把 MediaPipe 原始关键点（不再做任何翻转）落盘，便于对照排查。
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            raw_vis = draw_keypoints(image, out, color=(0, 0, 255))
+            cv2.imwrite(str(_DEBUG_DIR / "human_1_raw.png"), raw_vis)
+            r_eye: Keypoint | None = out.get("right_eye")
+            l_eye: Keypoint | None = out.get("left_eye")
+            logger.info(
+                "right_eye.x=%s left_eye.x=%s（不做自动翻转）",
+                r_eye.x if r_eye is not None else None,
+                l_eye.x if l_eye is not None else None,
+            )
+
         # 派生关键点：neck = 双肩中点。MediaPipe 不直接提供 neck 关键点，
         # 用双肩中点近似颈部位置，对 T 恤/衬衫的对齐已经足够。
         if "left_shoulder" in out and "right_shoulder" in out:
@@ -130,6 +171,14 @@ class MediaPipeHumanDetector(HumanDetector):
                 confidence=min(ls.confidence, rs.confidence),
                 name="neck",
             )
+
+            # 把"派生 neck"的图单独落盘，画一条双肩连线 + neck 标记。
+            if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+                v = draw_keypoints(image, out, color=(0, 255, 0))
+                cv2.line(v, (ls.x, ls.y), (rs.x, rs.y), (255, 255, 0), 2)
+                cv2.circle(v, (out["neck"].x, out["neck"].y), 12,
+                           (0, 255, 255), 2)
+                cv2.imwrite(str(_DEBUG_DIR / "human_3_neck.png"), v)
         return out
 
 

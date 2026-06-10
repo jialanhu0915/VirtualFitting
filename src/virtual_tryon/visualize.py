@@ -37,17 +37,25 @@ def draw_keypoints(
         # BGRA 合成到黑色背景再转 BGR，便于保存为 JPEG。
         annotated = cv2.cvtColor(annotated, cv2.COLOR_BGRA2BGR)
 
+    # 标签默认放在点上方；若点位于图像顶部附近（< 半径+留白），
+    # 把标签放到点的下方，避免被裁掉。
     for kp in keypoints.values():
         # 圆点。
         cv2.circle(annotated, (kp.x, kp.y), radius, color, -1, cv2.LINE_AA)
-        # 文字描边：先画白色粗边，再画黑色正文，提升在不同背景上的可读性。
+
+        if kp.y > radius + 12:
+            anchor = (kp.x - 30, kp.y - radius - 4)
+        else:
+            anchor = (kp.x - 30, kp.y + radius + 14)
+
+        # 文字描边：白色粗边 + 黑色正文，提升在不同背景上的可读性。
         cv2.putText(
-            annotated, kp.name, (kp.x - 30, kp.y - 12),
+            annotated, kp.name, anchor,
             cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
             thickness + 1, cv2.LINE_AA,
         )
         cv2.putText(
-            annotated, kp.name, (kp.x - 30, kp.y - 12),
+            annotated, kp.name, anchor,
             cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0),
             thickness, cv2.LINE_AA,
         )
