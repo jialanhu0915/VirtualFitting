@@ -29,11 +29,13 @@ logger = logging.getLogger(__name__)
 # 当前文件位于 src/virtual_tryon/human_detector.py，
 # 向上三级即为仓库根目录，模型缓存到根目录的 models/ 下。
 _MODELS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "models"
-_MODEL_PATH: Path = _MODELS_DIR / "pose_landmarker_lite.task"
+_MODEL_PATH: Path = _MODELS_DIR / "pose_landmarker_full.task"
 # MediaPipe 官方公共存储，提供 MediaPipe Solutions / Tasks API 的模型权重。
+# 使用 full 模型而非 lite：full 在长袖/交叉臂/侧身姿态下识别更稳定，
+# lite 在这些场景会出现左右镜像翻转。模型约 12MB。
 _MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+    "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
 )
 
 
