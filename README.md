@@ -149,26 +149,38 @@ MediaPipe提供33个身体关键点，我们主要使用：
 ## 📁 项目结构
 
 ```
-大作业/
-├── data_picture/
-│   ├── clothes/
-│   │   └── image.png          # 服装图像
-│   └── people/
-│       └── image.png          # 人体图像
-├── output/
-│   ├── human_keypoints_visualization.jpg    # 人体关键点可视化
-│   └── clothing_keypoints_visualization.jpg # 服装关键点可视化
-├── virtual_tryon_system.py    # 主程序
-├── requirements.txt           # 依赖列表
-└── README.md                  # 说明文档
+VirtualFitting/
+├── data_picture/                 # 输入样例
+│   ├── clothes/image.png         # 服装图像
+│   └── people/image.png          # 人体图像
+├── docker/                       # Docker 相关
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   ├── run_docker.sh
+│   ├── run_docker.ps1
+│   └── DOCKER_GUIDE.md
+├── main.py                       # 入口（交互菜单）
+├── virtual_tryon_simple.py       # 快速模式：OpenCV 关键点检测
+├── virtual_tryon_system.py       # 完整模式：MediaPipe 关键点检测
+├── virtual_tryon_complete.py     # 完整流程（含 TPS 变形 + 图像融合）
+├── requirements.txt              # pip 依赖
+├── pyproject.toml / uv.lock      # uv 项目配置与锁文件
+├── .python-version               # Python 版本（3.13）
+└── README.md
+
+`output/` 为运行生成结果目录，已通过 .gitignore 排除。
 ```
 
 ## 🎨 可视化输出
 
 运行程序后，会在 `output/` 文件夹生成：
 
-1. **human_keypoints_visualization.jpg** - 显示检测到的人体骨架和关键点
-2. **clothing_keypoints_visualization.jpg** - 显示提取的服装关键点
+| 文件 | 说明 |
+|---|---|
+| `human_keypoints.jpg` | 人体关键点可视化 |
+| `clothing_keypoints.jpg` | 服装关键点可视化 |
+| `warped_clothing.jpg` | TPS 变形后的服装（`complete` 版本） |
+| `final_tryon_result.jpg` | 最终试衣结果（`complete` 版本） |
 
 ## ⚠️ 注意事项
 
@@ -187,6 +199,23 @@ MediaPipe提供33个身体关键点，我们主要使用：
 - ✅ 全身或上半身可见
 - ✅ 光线充足
 - ❌ 避免严重遮挡
+
+## ❓ 常见问题
+
+**Q: `ModuleNotFoundError: No module named 'cv2'`**
+A: `pip install opencv-python opencv-contrib-python`
+
+**Q: `Permission denied` 安装依赖失败**
+A: Windows 用 `pip install --user ...`；Linux/Mac 加 `sudo` 或用 `pip install --user ...`。国内网络慢可换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+**Q: 找不到 `data_picture/.../image.png`**
+A: 检查文件路径与格式（PNG/JPG/JPEG）；文件名必须为 `image.png` 或修改 `main.py` 中的路径
+
+**Q: 未检测到人脸**
+A: 简化版会用图像中心估算关键点，不影响后续处理
+
+**Q: Docker 构建慢或失败**
+A: Dockerfile 已配置阿里云镜像与清华 pip 源。若仍失败，参见 `docker/DOCKER_GUIDE.md`
 
 ## 🔬 算法原理
 
@@ -220,33 +249,6 @@ MediaPipe提供33个身体关键点，我们主要使用：
   - 找到上下左右边界点
   - 根据比例关系定义其他关键点
 ```
-
-## 📈 下一步开发
-
-### 待实现功能
-
-1. **TPS变形模块**
-   ```python
-   # 薄板样条插值变形
-   def tps_warp(clothing_img, src_points, dst_points):
-       # 计算TPS变换
-       # 应用变形
-       # 返回变形后的服装
-   ```
-
-2. **图像融合模块**
-   ```python
-   # 多尺度融合
-   def blend_images(warped_clothing, person_img, mask):
-       # 颜色校正
-       # 泊松融合
-       # 边缘平滑
-   ```
-
-3. **完整流程**
-   ```python
-   human_kpts → clothing_kpts → TPS变形 → 图像融合 → 输出结果
-   ```
 
 ## 🆚 与深度学习方法对比
 
