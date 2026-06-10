@@ -1,0 +1,20 @@
+name: virtual-tryon-project
+
+services:
+  virtual-tryon:
+    build: .
+    container_name: virtual-tryon-system
+    volumes:
+      # 挂载数据目录（输入）
+      - ./data_picture:/app/data_picture
+      # 挂载输出目录（输出）
+      - ./output:/app/output
+      # 挂载代码目录（开发模式）
+      - ./:/app
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python virtual_tryon_simple.py
+    # 如果需要交互式运行
+    stdin_open: true
+    tty: true
