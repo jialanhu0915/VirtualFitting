@@ -1,5 +1,7 @@
 # Docker使用指南
 
+> 本目录包含 Docker 镜像与编排配置（`Dockerfile`、`docker-compose.yml`、运行脚本）。下文命令均假设在 `docker/` 目录下执行；从项目根目录调用 `docker/run_docker.sh` / `docker/run_docker.ps1` 即可自动进入该目录。
+
 ## 🐳 为什么使用Docker？
 
 使用Docker可以：

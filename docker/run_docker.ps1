@@ -1,5 +1,8 @@
 # Docker运行脚本 - PowerShell版本
 
+# 切到脚本所在目录，确保 docker-compose 能定位到 docker-compose.yml
+Set-Location $PSScriptRoot
+
 Write-Host "🚀 虚拟试衣系统 - Docker版本" -ForegroundColor Green
 Write-Host "================================" -ForegroundColor Cyan
 

@@ -54,7 +54,7 @@ switch ($choice) {
         }
         
         # 运行Docker
-        & ".\run_docker.ps1"
+        & ".\docker\run_docker.ps1"
     }
     "2" {
         Write-Host "`n🐍 使用本地Python运行..." -ForegroundColor Cyan

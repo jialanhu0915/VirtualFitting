@@ -31,16 +31,21 @@
 │   └── clothing_keypoints.jpg # 服装关键点可视化
 ├── virtual_tryon_simple.py    # 主程序（简化版）
 ├── virtual_tryon_system.py    # 主程序（完整版）
+├── virtual_tryon_complete.py  # 主程序（含TPS变形与图像融合）
 ├── main.py                    # 主入口程序
 ├── requirements.txt           # 依赖列表
-├── Dockerfile                 # Docker配置
-├── docker-compose.yml         # Docker编排文件
-├── setup_windows.ps1          # Windows安装脚本
-├── setup_linux.sh             # Linux/Mac安装脚本
-├── run_docker.ps1             # Docker运行脚本（Windows）
-├── run_docker.sh              # Docker运行脚本（Linux/Mac）
+├── pyproject.toml             # uv 项目配置
+├── uv.lock                    # 依赖锁文件
+├── start.ps1                  # Windows 启动菜单
+├── setup_windows.ps1          # Windows 安装脚本
+├── setup_linux.sh             # Linux/Mac 安装脚本
+├── docker/                    # Docker 相关文件
+│   ├── Dockerfile             # 镜像构建
+│   ├── docker-compose.yml     # 容器编排
+│   ├── run_docker.ps1         # 运行脚本（Windows）
+│   ├── run_docker.sh          # 运行脚本（Linux/Mac）
+│   └── DOCKER_GUIDE.md        # Docker 使用指南
 ├── README.md                  # 项目说明文档
-├── DOCKER_GUIDE.md            # Docker使用指南
 └── PROJECT_SUMMARY.md         # 本文档
 ```
 
@@ -99,7 +104,8 @@ chmod +x setup_linux.sh
 
 #### 方法3：使用Docker（如网络允许）
 ```bash
-# 构建并运行
+# 构建并运行（在 docker/ 目录下）
+cd docker
 docker-compose build
 docker-compose run --rm virtual-tryon
 ```

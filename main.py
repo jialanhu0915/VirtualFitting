@@ -66,9 +66,9 @@ def main():
     if choice == '3':
         print("\n🐳 启动Docker模式...")
         if os.name == 'nt':  # Windows
-            os.system("powershell -File run_docker.ps1")
+            os.system("powershell -File docker/run_docker.ps1")
         else:  # Linux/Mac
-            os.system("./run_docker.sh")
+            os.system("./docker/run_docker.sh")
         return
     
     # 检查输入文件

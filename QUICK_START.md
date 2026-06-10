@@ -277,7 +277,7 @@ img = cv2.resize(img, (img.shape[1]//2, img.shape[0]//2))
 1. **查看文档**：
    - `README.md` - 项目说明
    - `PROJECT_SUMMARY.md` - 项目总结
-   - `DOCKER_GUIDE.md` - Docker使用指南
+   - `docker/DOCKER_GUIDE.md` - Docker使用指南
 
 2. **检查日志**：
    - 程序运行时会输出详细的调试信息

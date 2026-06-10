@@ -26,24 +26,24 @@
 ```powershell
 # 1. 确保Docker Desktop已安装并运行
 # 2. 运行启动脚本
-.\run_docker.ps1
+.\docker\run_docker.ps1
 
 # 或者手动运行
-docker-compose build
-docker-compose run --rm virtual-tryon
+docker-compose -f docker/docker-compose.yml build
+docker-compose -f docker/docker-compose.yml run --rm virtual-tryon
 ```
 
 #### Linux/Mac用户：
 ```bash
 # 1. 给脚本执行权限
-chmod +x run_docker.sh
+chmod +x docker/run_docker.sh
 
 # 2. 运行启动脚本
-./run_docker.sh
+./docker/run_docker.sh
 
 # 或者手动运行
-docker-compose build
-docker-compose run --rm virtual-tryon
+docker-compose -f docker/docker-compose.yml build
+docker-compose -f docker/docker-compose.yml run --rm virtual-tryon
 ```
 
 #### Docker运行选项：
@@ -51,6 +51,8 @@ docker-compose run --rm virtual-tryon
 - **选项2**：已构建过直接运行
 - **选项3**：进入容器交互模式（用于调试）
 - **选项4**：清理Docker镜像
+
+> 详细 Docker 使用请参见 [`docker/DOCKER_GUIDE.md`](docker/DOCKER_GUIDE.md)。
 
 ### 方法2：Conda环境运行
 
@@ -73,8 +75,8 @@ pip install opencv-python mediapipe numpy Pillow scipy matplotlib scikit-image
 ### Docker方式（推荐）：
 ```bash
 # 自动运行
-./run_docker.ps1  # Windows
-./run_docker.sh   # Linux/Mac
+./docker/run_docker.ps1  # Windows
+./docker/run_docker.sh   # Linux/Mac
 ```
 
 ### 直接运行：
