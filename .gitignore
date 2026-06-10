@@ -11,6 +11,7 @@ wheels/
 
 # Generated outputs
 output/
+models/
 
 # Local editor / tool config
 .vscode/
