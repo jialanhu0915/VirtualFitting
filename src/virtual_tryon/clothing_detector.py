@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import cv2
@@ -11,6 +12,16 @@ import numpy as np
 from .keypoints import Keypoint
 
 logger = logging.getLogger(__name__)
+
+# rembg 模型缓存重定向到项目内 models/u2net/。
+# rembg 的 BaseSession.u2net_home() 读 U2NET_HOME 环境变量（没有则用 ~/.u2net，
+# Windows 下展开为 C:\Users\<user>\.u2net，会污染 C 盘）。
+# 必须在 import rembg 之前执行；这里只设环境变量不实际 import rembg，
+# 这样未安装 rembg 时本模块仍可正常加载。
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
+_REMBG_CACHE_ROOT: Path = _PROJECT_ROOT / "models" / "u2net"
+_REMBG_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["U2NET_HOME"] = str(_REMBG_CACHE_ROOT)
 
 # 调试目录：默认指向一个永远不存在的占位路径，未通过 set_debug_dir() 启用时
 # 所有 imwrite 调用都被短路；用 Path 而不是 None 是为了让 Pyright 在所有

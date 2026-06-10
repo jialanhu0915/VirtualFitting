@@ -11,12 +11,13 @@ dependencies = [
     "opencv-contrib-python>=4.8.1.78",
     "opencv-python>=4.8.1.78",
     "pillow>=10.1.0",
+    "rembg[cpu]>=2.0.76",
     "scikit-image>=0.22.0",
     "scipy>=1.11.4",
 ]
 
 [tool.pyright]
-# 源代码位于 src/ 下，main.py 通过 sys.path 注入 src/ 后导入包。
+# 源代码位于 src/ 下，main.py 和 scripts/ 下的脚本通过 sys.path 注入 src/ 后导入包。
 # 告诉 Pyright 同样的解析路径，避免误报 "could not be resolved"。
-include = ["main.py", "src"]
+include = ["main.py", "src", "scripts"]
 extraPaths = ["src"]
