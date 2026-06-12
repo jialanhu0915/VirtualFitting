@@ -54,11 +54,17 @@ class ClothingDetector:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
             mask = self._mask_from_alpha(image[:, :, 3])
             if mask is None:
-                # alpha 全不透明，alpha 没有任何分割信息，退化为色彩距离分割。
+                # alpha 全不透明，alpha 没有任何分割信息，走主分割 + fallback。
                 mask = self._segment(rgb)
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mask = self._segment(rgb)
+
+        # Fallback：当主分割的 mask 不可用（前景占比过低）时，调用 rembg
+        # 重新抠图。rembg 是可选依赖，未安装或调用失败时保持原 mask。
+        if not self._mask_is_usable(mask):
+            logger.info("主分割前景占比过低，fallback 到 rembg")
+            mask = self._segment_rembg(rgb)
 
         # 把分割掩码落盘，便于调试分割质量。
         if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
@@ -124,6 +130,44 @@ class ClothingDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         return mask
+
+    @staticmethod
+    def _mask_is_usable(mask: np.ndarray) -> bool:
+        """判断主分割 mask 是否可用。
+
+        两种失败模式：
+        1. 前景占比 < 5%：整张图被判为背景（如纯白衣服 vs 浅灰背景）。
+        2. 前景占比 > 70%：几乎全图都是前景（如浅粉衣服 vs 浅蓝背景，
+           闭运算把洞填满后整体被判为前景）——这种 mask 找出的最大
+           轮廓几乎等于整张图，关键点会跑到边界外。
+
+        两种情况都交给 rembg fallback。
+        """
+        fg = int((mask > 0).sum())
+        ratio = fg / mask.size
+        return 0.05 < ratio < 0.70
+
+    def _segment_rembg(self, rgb: np.ndarray) -> np.ndarray:
+        """用 rembg 抠出服装前景，返回二值 mask。
+
+        rembg 是可选依赖：未安装或首次调用失败时返回空 mask，
+        由上层 findContours 抛"未找到服装轮廓"异常——行为退化为
+        "无可用分割"，不会让程序崩溃。
+        """
+        try:
+            from rembg import new_session, remove  # noqa: WPS433
+        except ImportError:
+            logger.warning("rembg 未安装，跳过 fallback。请运行 "
+                           "`uv pip install rembg[cpu]` 后重试。")
+            return np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+        if not hasattr(self, "_rembg_session"):
+            logger.info("首次调用 rembg，按需下载模型到 %s", _REMBG_CACHE_ROOT)
+            self._rembg_session = new_session("u2net")
+
+        rgba = remove(rgb, session=self._rembg_session)
+        # rembg 输出 RGBA，alpha > 10 即视为前景（避免纯白边缘被当背景）。
+        return ((rgba[:, :, 3] > 10).astype(np.uint8)) * 255
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
