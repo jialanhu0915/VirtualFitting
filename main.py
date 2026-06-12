@@ -1,7 +1,9 @@
 """虚拟试衣流水线命令行入口。
 
 Stage 1 子命令：
-    detect   - 检测人体和服装关键点并保存可视化结果。
+    detect           - 同时检测人体和服装关键点（完整流程）。
+    detect-clothing  - 只检测服装关键点。
+    detect-human     - 只检测人体关键点。
 
 后续 Stage 计划加入：
     run      - 完整流水线（关键点 -> 变形 -> 融合）。
@@ -36,40 +38,66 @@ def _dump_keypoints(label: str, kpts: dict[str, Keypoint]) -> None:
         logger.info("  %-18s (%4d, %4d)  conf=%.2f", k, v.x, v.y, v.confidence)
 
 
-def cmd_detect(args: argparse.Namespace) -> int:
-    """`detect` 子命令：检测关键点并保存可视化。"""
-    # 服装图可能带 alpha 通道（PNG 透明背景），用 with_alpha 保留。
-    person_img = load_image(args.person)
-    clothing_img = load_image(args.clothing, with_alpha=True)
-
-    out_dir = ensure_dir(args.output)
+def _run_human(person_path: Path, out_dir: Path) -> dict[str, Keypoint]:
+    """加载人体图、设置 debug 目录、跑 RobustHumanDetector、保存可视化。"""
+    person_img = load_image(person_path)
     debug_dir = ensure_dir(out_dir / "debug")
     set_human_debug(debug_dir)
-    set_clothing_debug(debug_dir)
-
-    human_det = RobustHumanDetector()
-    clothing_det = ClothingDetector()
-
-    logger.info("正在检测人体关键点：%s", args.person)
-    human_kpts = human_det.detect(person_img)
-    logger.info("正在检测服装关键点：%s", args.clothing)
-    clothing_kpts = clothing_det.detect(clothing_img)
-
-    # 检测结束，关掉调试写入，避免后续画图再次落盘。
-    set_human_debug(None)
-    set_clothing_debug(None)
-
+    try:
+        human_det = RobustHumanDetector()
+        logger.info("正在检测人体关键点：%s", person_path)
+        kpts = human_det.detect(person_img)
+    finally:
+        set_human_debug(None)
     save_image(
         out_dir / "human_keypoints.jpg",
-        draw_keypoints(person_img, human_kpts),
+        draw_keypoints(person_img, kpts),
     )
+    _dump_keypoints("人体", kpts)
+    return kpts
+
+
+def _run_clothing(clothing_path: Path, out_dir: Path) -> dict[str, Keypoint]:
+    """加载服装图、设置 debug 目录、跑 ClothingDetector、保存可视化。"""
+    # 服装图可能带 alpha 通道（PNG 透明背景），用 with_alpha 保留。
+    clothing_img = load_image(clothing_path, with_alpha=True)
+    debug_dir = ensure_dir(out_dir / "debug")
+    set_clothing_debug(debug_dir)
+    try:
+        clothing_det = ClothingDetector()
+        logger.info("正在检测服装关键点：%s", clothing_path)
+        kpts = clothing_det.detect(clothing_img)
+    finally:
+        set_clothing_debug(None)
     save_image(
         out_dir / "clothing_keypoints.jpg",
-        draw_keypoints(clothing_img, clothing_kpts),
+        draw_keypoints(clothing_img, kpts),
     )
+    _dump_keypoints("服装", kpts)
+    return kpts
 
-    _dump_keypoints("人体", human_kpts)
-    _dump_keypoints("服装", clothing_kpts)
+
+def cmd_detect_human(args: argparse.Namespace) -> int:
+    """`detect-human` 子命令：只检测人体关键点并保存可视化。"""
+    out_dir = ensure_dir(args.output)
+    _run_human(args.person, out_dir)
+    logger.info("输出已写入 %s", out_dir)
+    return 0
+
+
+def cmd_detect_clothing(args: argparse.Namespace) -> int:
+    """`detect-clothing` 子命令：只检测服装关键点并保存可视化。"""
+    out_dir = ensure_dir(args.output)
+    _run_clothing(args.clothing, out_dir)
+    logger.info("输出已写入 %s", out_dir)
+    return 0
+
+
+def cmd_detect(args: argparse.Namespace) -> int:
+    """`detect` 子命令：同时检测人体和服装关键点并保存可视化。"""
+    out_dir = ensure_dir(args.output)
+    _run_human(args.person, out_dir)
+    _run_clothing(args.clothing, out_dir)
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -87,12 +115,26 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_det = sub.add_parser(
-        "detect", help="检测关键点并保存可视化结果"
+        "detect", help="同时检测人体和服装关键点并保存可视化结果"
     )
     p_det.add_argument("--person", required=True, help="人体图像路径")
     p_det.add_argument("--clothing", required=True, help="服装图像路径")
     p_det.add_argument("--output", default="output", help="输出目录")
     p_det.set_defaults(func=cmd_detect)
+
+    p_det_c = sub.add_parser(
+        "detect-clothing", help="只检测服装关键点并保存可视化"
+    )
+    p_det_c.add_argument("--clothing", required=True, help="服装图像路径")
+    p_det_c.add_argument("--output", default="output", help="输出目录")
+    p_det_c.set_defaults(func=cmd_detect_clothing)
+
+    p_det_h = sub.add_parser(
+        "detect-human", help="只检测人体关键点并保存可视化"
+    )
+    p_det_h.add_argument("--person", required=True, help="人体图像路径")
+    p_det_h.add_argument("--output", default="output", help="输出目录")
+    p_det_h.set_defaults(func=cmd_detect_human)
 
     args = parser.parse_args()
     return args.func(args)
