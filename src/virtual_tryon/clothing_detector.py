@@ -166,8 +166,9 @@ class ClothingDetector:
             self._rembg_session = new_session("u2net")
 
         rgba = remove(rgb, session=self._rembg_session)
-        # rembg 输出 RGBA，alpha > 10 即视为前景（避免纯白边缘被当背景）。
-        return ((rgba[:, :, 3] > 10).astype(np.uint8)) * 255
+        # rembg 输出 RGBA（PIL Image，Pyright 不知道其支持 numpy 索引），alpha > 10
+        # 即视为前景（避免纯白边缘被当背景）。
+        return ((rgba[:, :, 3] > 10).astype(np.uint8)) * 255  # type: ignore[index]
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
@@ -225,21 +226,44 @@ class ClothingDetector:
                 cv2.circle(v, (int(kp[0]), int(kp[1])), 10, (0, 0, 0), 2)
             cv2.imwrite(str(_DEBUG_DIR / f"clothing_3_{name}.png"), v)
 
-        # 1. 领口：找顶部下方 0~15% 范围内的轮廓凹点。
+        # 1. 领口：取顶部 25% 轮廓点，按 x 中位分成左右两半，
+        # 每半找最高点（y 最小），两点中点即为领口几何中心。
+        #
+        # 无论何种领型，领口总是由左右两个"尖"界定：圆领的领口
+        # 左右边缘、立领的左右领角、翻领的左右翻领尖。取顶部 25%
+        # 足以覆盖各种领型，同时不会包含袖子（袖端在肩部以下）。
         band_top = y_min
-        band_neck_bottom = int(y_min + ch * 0.15)
-        neck_band = pts_sorted[
-            (pts_sorted[:, 1] >= band_top) & (pts_sorted[:, 1] <= band_neck_bottom)
+        band_bottom = int(y_min + ch * 0.25)
+        top_band = pts_sorted[
+            (pts_sorted[:, 1] >= band_top) & (pts_sorted[:, 1] <= band_bottom)
         ]
-        neck_center, neck_found = ClothingDetector._find_dip_midpoint(neck_band)
-        if not neck_found:
-            top_band = pts_sorted[pts_sorted[:, 1] <= band_neck_bottom]
+        if len(top_band) < 2:
+            # 区间内点不够，退化到全图顶部中点。
+            top_band = pts_sorted[pts_sorted[:, 1] <= band_bottom]
             neck_center = (
                 int(top_band[:, 0].mean()),
                 int(top_band[:, 1].max()),
             )
+        else:
+            # 按 x 中位分成左右两半，每半找最高点。
+            x_med = int(np.median(top_band[:, 0]))
+            left_half = top_band[top_band[:, 0] <= x_med]
+            right_half = top_band[top_band[:, 0] > x_med]
+            if len(left_half) == 0 or len(right_half) == 0:
+                # 衣服不对称（如单侧遮挡），退化。
+                neck_center = (
+                    int(top_band[:, 0].mean()),
+                    int(top_band[:, 1].max()),
+                )
+            else:
+                left_peak = left_half[np.argmin(left_half[:, 1])]
+                right_peak = right_half[np.argmin(right_half[:, 1])]
+                neck_center = (
+                    int((left_peak[0] + right_peak[0]) // 2),
+                    int((left_peak[1] + right_peak[1]) // 2),
+                )
         _save_step("neck", neck_center,
-                   (band_top, band_neck_bottom), (0, 0, 255))
+                   (band_top, band_bottom), (0, 0, 255))
 
         # 2. 肩部
         shoulder_band_top = int(neck_center[1] + ch * 0.12)
@@ -304,46 +328,6 @@ class ClothingDetector:
             "left_bottom":    mk("left_bottom",    left_bottom),
             "right_bottom":   mk("right_bottom",   right_bottom),
         }
-
-    @staticmethod
-    def _find_dip_midpoint(band: np.ndarray) -> tuple[tuple[int, int], bool]:
-        """在指定 y 区间内的轮廓点中找最深凹点，返回 (x, y) 和是否找到。
-
-        凹点定义：点 p 的 y 大于同一 y 行左右 5% 宽度范围内其他点的 y 均值。
-        实现：按 y 分桶取中线，对相邻 3 桶做"中线 y 下降后回升"的拐点检测。
-        """
-        if len(band) < 5:
-            return ((0, 0), False)
-
-        ys = band[:, 1].astype(int)
-        xs = band[:, 0].astype(int)
-        y_lo, y_hi = ys.min(), ys.max()
-        if y_hi - y_lo < 4:
-            return ((int(xs.mean()), int(ys.mean())), False)
-
-        # 按 y 分成 8 桶，每桶取 x 中位和 y 最大（最深）。
-        n_buckets = 8
-        bucket_h = max(1, (y_hi - y_lo) // n_buckets)
-        centers: list[tuple[int, int]] = []
-        for i in range(n_buckets):
-            mask = (ys >= y_lo + i * bucket_h) & (ys < y_lo + (i + 1) * bucket_h)
-            if mask.sum() == 0:
-                continue
-            x_med = int(np.median(xs[mask]))
-            y_max = int(ys[mask].max())
-            centers.append((x_med, y_max))
-
-        # 找最深凹点：从上往下 y 增大最显著的位置（即往下凹）。
-        best = (0, 0)
-        best_depth = -1
-        for i in range(1, len(centers) - 1):
-            depth = centers[i][1] - centers[i - 1][1]
-            if depth > best_depth:
-                best_depth = depth
-                best = centers[i]
-        if best_depth <= 0:
-            return ((0, 0), False)
-        return best, True
 
     @staticmethod
     def _left_right_extrema(
