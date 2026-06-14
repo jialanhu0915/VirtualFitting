@@ -1,9 +1,8 @@
-"""平铺服装图的关键点检测。"""
+"""平铺服装图的关键点检测（纯传统 CV，不依赖任何深度学习模型）。"""
 
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import cv2
@@ -12,16 +11,6 @@ import numpy as np
 from .keypoints import Keypoint
 
 logger = logging.getLogger(__name__)
-
-# rembg 模型缓存重定向到项目内 models/u2net/。
-# rembg 的 BaseSession.u2net_home() 读 U2NET_HOME 环境变量（没有则用 ~/.u2net，
-# Windows 下展开为 C:\Users\<user>\.u2net，会污染 C 盘）。
-# 必须在 import rembg 之前执行；这里只设环境变量不实际 import rembg，
-# 这样未安装 rembg 时本模块仍可正常加载。
-_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
-_REMBG_CACHE_ROOT: Path = _PROJECT_ROOT / "models" / "u2net"
-_REMBG_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-os.environ["U2NET_HOME"] = str(_REMBG_CACHE_ROOT)
 
 # 调试目录：默认指向一个永远不存在的占位路径，未通过 set_debug_dir() 启用时
 # 所有 imwrite 调用都被短路；用 Path 而不是 None 是为了让 Pyright 在所有
@@ -36,14 +25,14 @@ def set_debug_dir(path: Path | None) -> None:
 
 
 class ClothingDetector:
-    """从平铺服装图中提取 8 个关键点。
+    """从平铺服装图中提取 8 个关键点（纯传统 CV，单一方法：边缘检测）。
 
-    策略：
-      1. 若图像带 alpha 通道且含有实际透明信息，用 alpha 通道做掩码。
-      2. 否则使用色彩距离 (max(R,G,B)-min(R,G,B)) + 形态学开闭运算分割。
-      3. 取最大外轮廓。
-      4. 按轮廓几何特征自适应派生 8 个关键点（领口凹点、肩部/腋下左右极值、
-         下摆左右端点内缩）。
+    分割策略：CLAHE 拉伸灰度 → 多通道 Canny → 闭运算封口 → 最大轮廓填充。
+    适合所有颜色组合（含白衬衫 vs 白底），CLAHE 拉伸能放大弱边缘。
+    若图像带 alpha 通道且含实际透明信息，优先用 alpha 通道抠图（成本低）。
+
+    取最大外轮廓后，按轮廓几何特征自适应派生 8 个关键点
+    （领口凹点、肩部/腋下左右极值、下摆左右端点内缩）。
 
     Raises:
         RuntimeError: 找不到合格的服装轮廓时抛出。
@@ -54,25 +43,18 @@ class ClothingDetector:
     ) -> tuple[np.ndarray, np.ndarray, tuple[float, float]]:
         """从服装图中提取轮廓并均匀采样 n_points 个点，同时返回 mask 和领口锚点。
 
-        复用 detect() 的 mask 提取流水线（alpha → 色彩距离 → rembg fallback）。
-
         Returns:
             (points, mask, neck_anchor): points 是 (n_points, 2) int32 采样坐标，
             mask 是二值前景掩码。
         """
-        # 复用 mask 提取逻辑，与 detect() 前段完全一致。
         if image.ndim == 3 and image.shape[2] == 4:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
             mask = self._mask_from_alpha(image[:, :, 3])
             if mask is None:
-                mask = self._segment(rgb)
+                mask = self._segment_edge(rgb)
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            mask = self._segment(rgb)
-
-        if not self._mask_is_usable(mask):
-            logger.info("主分割前景占比过低，fallback 到 rembg")
-            mask = self._segment_rembg(rgb)
+            mask = self._segment_edge(rgb)
 
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -143,17 +125,11 @@ class ClothingDetector:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
             mask = self._mask_from_alpha(image[:, :, 3])
             if mask is None:
-                # alpha 全不透明，alpha 没有任何分割信息，走主分割 + fallback。
-                mask = self._segment(rgb)
+                # alpha 全不透明，alpha 没有任何分割信息，走边缘检测抠图。
+                mask = self._segment_edge(rgb)
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            mask = self._segment(rgb)
-
-        # Fallback：当主分割的 mask 不可用（前景占比过低）时，调用 rembg
-        # 重新抠图。rembg 是可选依赖，未安装或调用失败时保持原 mask。
-        if not self._mask_is_usable(mask):
-            logger.info("主分割前景占比过低，fallback 到 rembg")
-            mask = self._segment_rembg(rgb)
+            mask = self._segment_edge(rgb)
 
         # 把分割掩码落盘，便于调试分割质量。
         if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
@@ -186,78 +162,49 @@ class ClothingDetector:
             return None
         return ((alpha > 10).astype(np.uint8)) * 255
 
-    @staticmethod
-    def _segment(rgb: np.ndarray) -> np.ndarray:
-        """从 RGB 图像分割出服装区域。
+    def _segment_edge(self, rgb: np.ndarray) -> np.ndarray:
+        """基于边缘检测的服装分割（CLAHE + 多通道 Canny + 闭运算 + 填充分割）。
 
-        策略：服装通常是彩色主体，背景是白色/灰色/纯色，所以
-        用 "远离灰度" 的距离作为前景度量比 Otsu 更稳健：
-        对每个像素，把 R、G、B 三通道的方差开根号，距离灰度越远
-        越可能是彩色服装。阈值取自适应（最大距离的 30%）。
+        整个抠图流程的唯一方法。CLAHE 拉伸放大弱边缘，多通道 Canny 投票
+        捕获色距相同但灰度突变的边界，最后取最大外轮廓填充。
 
-        然后做形态学闭运算填补花纹里的洞，再做开运算去掉孤立点。
+        Args:
+            rgb: 输入 RGB 图 (H, W, 3)。
+
+        Returns:
+            二值前景 mask (H, W)，dtype=uint8，全 0 表示放弃分割。
         """
-        # 各像素到灰度的"色彩距离"：max(R,G,B) - min(R,G,B)。
-        # 白色背景为 0；彩色服装一般 > 30。
-        r, g, b = rgb[:, :, 0].astype(int), rgb[:, :, 1].astype(int), rgb[:, :, 2].astype(int)
-        color_dist = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-        # 把色彩距离落盘成伪彩色热力图，便于肉眼判断分割质量。
-        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
-            norm = np.clip(color_dist, 0, 255).astype(np.uint8)
-            heatmap = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-            cv2.imwrite(str(_DEBUG_DIR / "clothing_0_color_distance.png"), heatmap)
+        # 1. CLAHE 自适应直方图均衡——把窄灰度带拉开，暴露被压平的边缘。
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
 
-        # 自适应阈值：取最大距离的 20% 作为分界，至少 5。
-        # 下限 5 是为了排除纯白/纯灰背景的微小噪声；20% 比例让浅紫、浅粉
-        # 等花纹也能被判为前景（不会被硬卡掉）。
-        thresh = max(5, int(color_dist.max() * 0.20))
-        mask = (color_dist > thresh).astype(np.uint8) * 255
+        # 2. 多通道 Canny 合并：灰度(均衡后) + B + G + R + Lab-L。
+        #    多通道投票能捕获色距相同但灰度突变的边界（如浅色 vs 浅灰）。
+        edges = np.zeros(bgr.shape[:2], dtype=np.uint8)
+        edges = cv2.bitwise_or(edges, cv2.Canny(gray_eq, 50, 150))
+        for ch in range(3):  # B, G, R 各自做 Canny
+            edges = cv2.bitwise_or(edges, cv2.Canny(bgr[:, :, ch], 50, 150))
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab)
+        edges = cv2.bitwise_or(edges, cv2.Canny(lab[:, :, 0], 50, 150))
 
-        # 闭运算填补花纹内的洞，开运算去掉背景噪点。
-        kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        # 3. 闭运算 + 二次膨胀封口，把 Canny 边缘连成闭合环。
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        closed = cv2.dilate(closed, kernel, iterations=1)
+
+        # 4. 取最大外轮廓并填充。
+        contours, _ = cv2.findContours(
+            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return np.zeros(bgr.shape[:2], dtype=np.uint8)
+        main = max(contours, key=cv2.contourArea)
+        mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [main], 255)
         return mask
-
-    @staticmethod
-    def _mask_is_usable(mask: np.ndarray) -> bool:
-        """判断主分割 mask 是否可用。
-
-        两种失败模式：
-        1. 前景占比 < 5%：整张图被判为背景（如纯白衣服 vs 浅灰背景）。
-        2. 前景占比 > 70%：几乎全图都是前景（如浅粉衣服 vs 浅蓝背景，
-           闭运算把洞填满后整体被判为前景）——这种 mask 找出的最大
-           轮廓几乎等于整张图，关键点会跑到边界外。
-
-        两种情况都交给 rembg fallback。
-        """
-        fg = int((mask > 0).sum())
-        ratio = fg / mask.size
-        return 0.05 < ratio < 0.70
-
-    def _segment_rembg(self, rgb: np.ndarray) -> np.ndarray:
-        """用 rembg 抠出服装前景，返回二值 mask。
-
-        rembg 是可选依赖：未安装或首次调用失败时返回空 mask，
-        由上层 findContours 抛"未找到服装轮廓"异常——行为退化为
-        "无可用分割"，不会让程序崩溃。
-        """
-        try:
-            from rembg import new_session, remove  # noqa: WPS433
-        except ImportError:
-            logger.warning("rembg 未安装，跳过 fallback。请运行 "
-                           "`uv pip install rembg[cpu]` 后重试。")
-            return np.zeros(rgb.shape[:2], dtype=np.uint8)
-
-        if not hasattr(self, "_rembg_session"):
-            logger.info("首次调用 rembg，按需下载模型到 %s", _REMBG_CACHE_ROOT)
-            self._rembg_session = new_session("u2net")
-
-        rgba = remove(rgb, session=self._rembg_session)
-        # rembg 输出 RGBA（PIL Image，Pyright 不知道其支持 numpy 索引），alpha > 10
-        # 即视为前景（避免纯白边缘被当背景）。
-        return ((rgba[:, :, 3] > 10).astype(np.uint8)) * 255  # type: ignore[index]
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
