@@ -313,3 +313,76 @@ class RobustHumanDetector(HumanDetector):
                 logger.warning("%s 检测失败: %s", type(det).__name__, e)
                 last_err = e
         raise RuntimeError(f"所有人体检测器均失败，最后错误: {last_err}")
+
+
+def body_region_contour(
+    kpts: dict[str, Keypoint],
+    n_points: int = 30,
+    expand_ratio: float = 0.05,
+) -> np.ndarray:
+    """从 MediaPipe 关键点提取躯干区域轮廓。
+
+    用肩-腋-腰-髋围成的多边形近似"衣服应该覆盖的身体区域"，
+    然后沿多边形边均匀采样 n_points 个点。
+
+    Args:
+        kpts: MediaPipe / RobustHumanDetector 返回的 33 关键点。
+        n_points: 采样点数，应与衣服轮廓采样点数一致。
+        expand_ratio: 轮廓外扩比例，防止 warp 后衣服边缘露肉。
+    """
+    # 需要的关键点（按 MediaPipe 命名）
+    required = ["left_shoulder", "right_shoulder",
+                "left_hip", "right_hip", "neck"]
+    for name in required:
+        if name not in kpts:
+            raise ValueError(f"缺少人体关键点: {name}")
+
+    ls = (kpts["left_shoulder"].x, kpts["left_shoulder"].y)
+    rs = (kpts["right_shoulder"].x, kpts["right_shoulder"].y)
+    lh = (kpts["left_hip"].x, kpts["left_hip"].y)
+    rh = (kpts["right_hip"].x, kpts["right_hip"].y)
+    neck = (kpts["neck"].x, kpts["neck"].y)
+
+    # 左右腋下近似：肩→髋 的 1/3 处（臂窝通常在躯干上部）。
+    l_armpit = (int(ls[0] + (lh[0] - ls[0]) * 0.30),
+                int(ls[1] + (lh[1] - ls[1]) * 0.30))
+    r_armpit = (int(rs[0] + (rh[0] - rs[0]) * 0.30),
+                int(rs[1] + (rh[1] - rs[1]) * 0.30))
+    # 底部中点
+    bottom = ((lh[0] + rh[0]) // 2, max(lh[1], rh[1]))
+
+    # 躯干多边形顶点（逆时针：左肩 → 左腋 → 左髋 → 底中点 → 右髋 → 右腋 → 右肩 → 颈）
+    verts = np.array([
+        neck,                          # 0  颈
+        ls,                            # 1  左肩
+        l_armpit,                      # 2  左腋下近似
+        lh,                            # 3  左髋
+        bottom,                        # 4  底部中点
+        rh,                            # 5  右髋
+        r_armpit,                      # 6  右腋下近似
+        rs,                            # 7  右肩
+    ], dtype=np.float32)
+
+    # 外扩一点（按 expand_ratio），避免 warp 后衣服边缘露肉。
+    if expand_ratio > 0:
+        cx = verts[:, 0].mean()
+        cy = verts[:, 1].mean()
+        for i in range(len(verts)):
+            dx, dy = verts[i][0] - cx, verts[i][1] - cy
+            dist = np.sqrt(dx * dx + dy * dy) + 1e-6
+            verts[i][0] += dx / dist * expand_ratio * (abs(dx) + abs(dy))
+            verts[i][1] += dy / dist * expand_ratio * (abs(dx) + abs(dy))
+
+    # 计算段长和累计弧长，均匀采样 n_points。
+    diffs = np.diff(verts, axis=0, append=verts[0:1])
+    seg_lens = np.sqrt((diffs ** 2).sum(axis=1))
+    cum_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total = cum_len[-1]
+    if total <= 0:
+        return verts.astype(np.int32)
+    sample_lens = np.linspace(0, total, n_points, endpoint=False)
+    indices = np.searchsorted(cum_len, sample_lens, side="right") - 1
+    indices = np.clip(indices, 0, len(verts) - 1)
+    t = (sample_lens - cum_len[indices]) / np.maximum(seg_lens[indices], 1e-6)
+    sampled = verts[indices] + t[:, np.newaxis] * diffs[indices]
+    return sampled.astype(np.int32)

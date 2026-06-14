@@ -5,9 +5,8 @@ Stage 1 子命令：
     detect-clothing  - 只检测服装关键点。
     detect-human     - 只检测人体关键点。
 
-后续 Stage 计划加入：
-    run      - 完整流水线（关键点 -> 变形 -> 融合）。
-    ablation - 在同一组输入上跑多种 warper/blender 组合用于对比。
+Stage 2 子命令：
+    run              - 完整流水线（轮廓采样 → TPS 变形 → 融合）。
 """
 
 from __future__ import annotations
@@ -17,15 +16,21 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # 把 src/ 加入 sys.path，让仓库内的包可以直接被 import，
 # 避免必须先 `pip install -e .` 才能跑。
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from virtual_tryon import ClothingDetector, Keypoint, RobustHumanDetector
-from virtual_tryon.human_detector import set_debug_dir as set_human_debug
+from virtual_tryon.human_detector import (
+    body_region_contour,
+    set_debug_dir as set_human_debug,
+)
 from virtual_tryon.clothing_detector import set_debug_dir as set_clothing_debug
 from virtual_tryon.io import ensure_dir, load_image, save_image
+from virtual_tryon.tps_warp import blend, warp_clothing
 from virtual_tryon.visualize import draw_keypoints
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,52 @@ def cmd_detect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    """`run` 子命令：完整虚拟试衣流水线。"""
+    out_dir = ensure_dir(args.output)
+
+    # 1. 加载图像
+    person_img = load_image(args.person)
+    clothing_img = load_image(args.clothing, with_alpha=True)
+    if clothing_img.shape[2] == 4:
+        clothing_rgb = clothing_img[:, :, :3]
+    else:
+        clothing_rgb = clothing_img
+
+    # 2. 人体检测 → 躯干区域轮廓
+    human_det = RobustHumanDetector()
+    human_kpts = human_det.detect(person_img)
+    body_pts = body_region_contour(human_kpts, n_points=args.n_points)
+
+    # 3. 衣服轮廓采样（同时得到 mask）
+    clothing_det = ClothingDetector()
+    clothing_pts, clothing_mask = clothing_det.sample_contour(
+        clothing_img, n_points=args.n_points,
+    )
+
+    # 用 mask 抠掉衣服背景，避免白底被一起 warp 到人体上
+    mask_3ch = clothing_mask[:, :, np.newaxis] / 255.0
+    clothing_fg = (clothing_rgb.astype(np.float32) * mask_3ch).astype(np.uint8)
+
+    # 4. 仿射变形
+    logger.info("正在进行仿射变形...")
+    warped_rgb, warped_mask = warp_clothing(
+        clothing_fg, clothing_mask, clothing_pts, body_pts,
+        out_shape=person_img.shape[:2],
+    )
+
+    # 5. 融合
+    result = blend(person_img, warped_rgb, warped_mask)
+    save_image(out_dir / "result.jpg", result)
+
+    # 中间产物
+    save_image(out_dir / "warped_clothing.jpg", warped_rgb)
+    save_image(out_dir / "warped_mask.jpg", warped_mask)
+
+    logger.info("输出已写入 %s", out_dir)
+    return 0
+
+
 def main() -> int:
     """CLI 入口：解析子命令并分发。"""
     logging.basicConfig(
@@ -135,6 +186,16 @@ def main() -> int:
     p_det_h.add_argument("--person", required=True, help="人体图像路径")
     p_det_h.add_argument("--output", default="output", help="输出目录")
     p_det_h.set_defaults(func=cmd_detect_human)
+
+    p_run = sub.add_parser(
+        "run", help="完整虚拟试衣流水线（轮廓采样 → TPS 变形 → 融合）"
+    )
+    p_run.add_argument("--person", required=True, help="人体图像路径")
+    p_run.add_argument("--clothing", required=True, help="服装图像路径")
+    p_run.add_argument("--output", default="output/run", help="输出目录")
+    p_run.add_argument("--n-points", type=int, default=30,
+                       help="轮廓采样点数（默认 30）")
+    p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
     return args.func(args)

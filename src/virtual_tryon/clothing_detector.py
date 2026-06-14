@@ -49,6 +49,67 @@ class ClothingDetector:
         RuntimeError: 找不到合格的服装轮廓时抛出。
     """
 
+    def sample_contour(
+        self, image: np.ndarray, n_points: int = 30,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """从服装图中提取轮廓并均匀采样 n_points 个点，同时返回 mask。
+
+        复用 detect() 的 mask 提取流水线（alpha → 色彩距离 → rembg fallback），
+        但不做语义关键点派生。
+
+        Returns:
+            (points, mask): points 是 (n_points, 2) int32 采样坐标，
+            mask 是二值前景掩码。
+        """
+        # 复用 mask 提取逻辑，与 detect() 前段完全一致。
+        if image.ndim == 3 and image.shape[2] == 4:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+            mask = self._mask_from_alpha(image[:, :, 3])
+            if mask is None:
+                mask = self._segment(rgb)
+        else:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mask = self._segment(rgb)
+
+        if not self._mask_is_usable(mask):
+            logger.info("主分割前景占比过低，fallback 到 rembg")
+            mask = self._segment_rembg(rgb)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            raise RuntimeError("未找到服装轮廓")
+        contour = max(contours, key=cv2.contourArea)
+
+        # 按弧长均匀采样 n_points 个点。
+        points = self._sample_evenly(contour, n_points)
+        return points, mask
+
+    @staticmethod
+    def _sample_evenly(contour: np.ndarray, n_points: int) -> np.ndarray:
+        """沿轮廓弧长均匀采样 n_points 个点，返回 (n_points, 2)。"""
+        pts = contour.reshape(-1, 2).astype(np.float32)
+        # 首尾接合形成闭合轮廓
+        if len(pts) > 1 and np.any(pts[0] != pts[-1]):
+            pts = np.vstack([pts, pts[0:1]])
+        # 计算段长和累计弧长
+        diffs = np.diff(pts, axis=0)
+        seg_lens = np.sqrt((diffs ** 2).sum(axis=1))
+        cum_len = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total = cum_len[-1]
+        if total <= 0:
+            # 退化：轮廓太小，直接返回原有点
+            return contour.reshape(-1, 2)[:n_points]
+        # 等弧长采样
+        sample_lens = np.linspace(0, total, n_points, endpoint=False)
+        indices = np.searchsorted(cum_len, sample_lens, side="right") - 1
+        indices = np.clip(indices, 0, len(pts) - 2)
+        # 在段内线性插值
+        t = (sample_lens - cum_len[indices]) / np.maximum(seg_lens[indices], 1e-6)
+        sampled = pts[indices] + t[:, np.newaxis] * diffs[indices]
+        return sampled.astype(np.int32)
+
     def detect(self, image: np.ndarray) -> dict[str, Keypoint]:
         if image.ndim == 3 and image.shape[2] == 4:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
