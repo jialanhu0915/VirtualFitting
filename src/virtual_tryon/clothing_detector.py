@@ -51,14 +51,13 @@ class ClothingDetector:
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """从服装图中提取轮廓并均匀采样 n_points 个点，同时返回 mask。
+    ) -> tuple[np.ndarray, np.ndarray, tuple[float, float]]:
+        """从服装图中提取轮廓并均匀采样 n_points 个点，同时返回 mask 和领口锚点。
 
-        复用 detect() 的 mask 提取流水线（alpha → 色彩距离 → rembg fallback），
-        但不做语义关键点派生。
+        复用 detect() 的 mask 提取流水线（alpha → 色彩距离 → rembg fallback）。
 
         Returns:
-            (points, mask): points 是 (n_points, 2) int32 采样坐标，
+            (points, mask, neck_anchor): points 是 (n_points, 2) int32 采样坐标，
             mask 是二值前景掩码。
         """
         # 复用 mask 提取逻辑，与 detect() 前段完全一致。
@@ -84,7 +83,36 @@ class ClothingDetector:
 
         # 按弧长均匀采样 n_points 个点。
         points = self._sample_evenly(contour, n_points)
-        return points, mask
+
+        # 领口锚点：用两尖中点算法（与 _extract_keypoints 一致）
+        raw_pts = contour.reshape(-1, 2)
+        neck_anchor = self._find_neck_anchor(raw_pts)
+        return points, mask, neck_anchor
+
+    @staticmethod
+    def _find_neck_anchor(pts: np.ndarray) -> tuple[float, float]:
+        """从轮廓点中计算领口锚点（两尖中点算法）。
+
+        取顶部 25% 点，按 x 中位分左右半，每半找最高点(y最小)，返回中点。
+        与 _extract_keypoints 的领口逻辑一致，但不走完整的 8 点派生流程。
+        """
+        order = np.argsort(pts[:, 1])
+        sorted_pts = pts[order]
+        y_min = int(sorted_pts[0, 1])
+        y_max = int(sorted_pts[-1, 1])
+        ch = max(y_max - y_min, 1)
+        band_bottom = int(y_min + ch * 0.25)
+        top_band = sorted_pts[sorted_pts[:, 1] <= band_bottom]
+        if len(top_band) < 2:
+            return (float(pts[:, 0].mean()), float(pts[:, 1].min()))
+        x_med = int(np.median(top_band[:, 0]))
+        left = top_band[top_band[:, 0] <= x_med]
+        right = top_band[top_band[:, 0] > x_med]
+        if len(left) == 0 or len(right) == 0:
+            return (float(top_band[:, 0].mean()), float(top_band[:, 1].max()))
+        lp = left[np.argmin(left[:, 1])]
+        rp = right[np.argmin(right[:, 1])]
+        return (float((lp[0] + rp[0]) / 2), float((lp[1] + rp[1]) / 2))
 
     @staticmethod
     def _sample_evenly(contour: np.ndarray, n_points: int) -> np.ndarray:

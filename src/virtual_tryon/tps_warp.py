@@ -109,6 +109,8 @@ def warp_clothing(
     clothing_contour: np.ndarray,
     body_contour: np.ndarray,
     out_shape: tuple[int, int],
+    clothing_anchor: tuple[float, float] | None = None,
+    body_anchor: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
 
@@ -118,6 +120,8 @@ def warp_clothing(
         clothing_contour: 衣服轮廓采样点 (n, 2)，在衣服图坐标系
         body_contour: 人体躯干轮廓 (n, 2)，在人体图坐标系
         out_shape: 输出图尺寸 (H, W)
+        clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
+        body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
 
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
@@ -128,7 +132,7 @@ def warp_clothing(
 
     H, W = out_shape
 
-    # 用外接矩形估算缩放+平移（不用 RANSAC，避免退化映射）
+    # 用外接矩形估算缩放（cover 身体区域）
     sx_min, sy_min = src_pts[:, 0].min(), src_pts[:, 1].min()
     sx_max, sy_max = src_pts[:, 0].max(), src_pts[:, 1].max()
     dx_min, dy_min = dst_pts[:, 0].min(), dst_pts[:, 1].min()
@@ -137,9 +141,18 @@ def warp_clothing(
     src_h = max(sy_max - sy_min, 1)
     dst_w = max(dx_max - dx_min, 1)
     dst_h = max(dy_max - dy_min, 1)
-    scale = min(dst_w / src_w, dst_h / src_h)  # 等比缩放，不变形
-    tx = dx_min + (dst_w - src_w * scale) / 2 - sx_min * scale
-    ty = dy_min + (dst_h - src_h * scale) / 2 - sy_min * scale
+    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
+
+    # 锚点定位：衣服领口 → 人体脖子
+    if clothing_anchor is None:
+        clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
+    if body_anchor is None:
+        body_anchor = (float(dx_min + dx_max) / 2, float(dy_min))
+
+    cx, cy = clothing_anchor
+    bx, by = body_anchor
+    tx = bx - cx * scale
+    ty = by - cy * scale
     M_affine = np.array([
         [scale, 0, tx],
         [0, scale, ty],

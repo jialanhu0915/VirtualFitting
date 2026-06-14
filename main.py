@@ -124,21 +124,31 @@ def cmd_run(args: argparse.Namespace) -> int:
     human_kpts = human_det.detect(person_img)
     body_pts = body_region_contour(human_kpts, n_points=args.n_points)
 
-    # 3. 衣服轮廓采样（同时得到 mask）
+    # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
     clothing_det = ClothingDetector()
-    clothing_pts, clothing_mask = clothing_det.sample_contour(
+    clothing_pts, clothing_mask, cloth_anchor = clothing_det.sample_contour(
         clothing_img, n_points=args.n_points,
     )
 
-    # 用 mask 抠掉衣服背景，避免白底被一起 warp 到人体上
+    # 用 mask 抠掉衣服背景
     mask_3ch = clothing_mask[:, :, np.newaxis] / 255.0
     clothing_fg = (clothing_rgb.astype(np.float32) * mask_3ch).astype(np.uint8)
 
-    # 4. 仿射变形
-    logger.info("正在进行仿射变形...")
+    # 人体脖子锚点：MediaPipe neck=双肩中点（肩线高度），
+    # 衣服领口应略高于肩线。用人脸 nose 到 neck 距离的 30% 作向上偏移。
+    nose_y = float(human_kpts["nose"].y)
+    neck_x = float(human_kpts["neck"].x)
+    neck_y = float(human_kpts["neck"].y)
+    neck_offset = max(0.0, (neck_y - nose_y) * 0.30)
+    body_anchor = (neck_x, neck_y - neck_offset)
+
+    # 4. 仿射变形（领口 → 脖子锚定）
+    logger.info("正在进行仿射变形（领口→脖子锚定）...")
     warped_rgb, warped_mask = warp_clothing(
         clothing_fg, clothing_mask, clothing_pts, body_pts,
         out_shape=person_img.shape[:2],
+        clothing_anchor=cloth_anchor,
+        body_anchor=body_anchor,
     )
 
     # 5. 融合
