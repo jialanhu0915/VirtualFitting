@@ -204,6 +204,10 @@ class ClothingDetector:
         main = max(contours, key=cv2.contourArea)
         mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [main], 255)
+
+        # 5. 内缩补偿：dilation 把 mask 撑到白底里 ~7 像素，回缩同等大小让 mask
+        # 紧贴衣服实际边缘，避免 warp 后透出白底产生白边。
+        mask = cv2.erode(mask, kernel, iterations=1)
         return mask
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:

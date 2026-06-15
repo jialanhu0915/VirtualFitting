@@ -176,12 +176,24 @@ def blend(
     warped_rgb: np.ndarray,
     warped_mask: np.ndarray,
 ) -> np.ndarray:
-    """将 warp 后的衣服叠加到人体图上（简单 alpha 混合）。
+    """将 warp 后的衣服叠加到人体图上（带边缘羽化的 alpha 混合）。
 
-    mask 边缘做高斯模糊以减轻接缝。
+    修复白边问题：
+    1. mask 收回：warpAffine 对 mask 和 rgb 是独立插值的，插值会让 mask
+       边缘比 warped_rgb 实际覆盖多出一圈，导致 blend 时透出黑色 border。
+       用 "mask AND (warped_rgb != 黑色 border)" 把 mask 收回到实际衣服覆盖区。
+    2. mask 内缩 ~1% min_dim：衣服图本身带的"白边"（如 qipao 白底 + 分割
+       dilation 引入的白边）会被 warp 出来显示成白边。预先 erode 几步消掉。
+    3. 边缘羽化：高斯模糊让 mask 边界平滑过渡。
     """
-    mask_f = warped_mask.astype(np.float32) / 255.0
-    # 边缘羽化
+    # 1. mask 收回：只在 warped_rgb 有颜色的地方使用 mask
+    has_color = (warped_rgb.max(axis=2) > 0).astype(np.uint8) * 255
+    mask = cv2.min(warped_mask, has_color)
+    # 2. mask 内缩，去掉衣服图的白边
+    erode_k = max(3, int(min(mask.shape[:2]) * 0.01) // 2 * 2 + 1)
+    mask = cv2.erode(mask, np.ones((erode_k, erode_k), np.uint8))
+    # 3. 边缘羽化
+    mask_f = mask.astype(np.float32) / 255.0
     kernel = max(3, int(min(mask_f.shape[:2]) * 0.02) // 2 * 2 + 1)
     mask_f = cv2.GaussianBlur(mask_f, (kernel, kernel), 0)
 
