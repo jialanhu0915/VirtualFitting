@@ -66,35 +66,48 @@ class ClothingDetector:
         # 按弧长均匀采样 n_points 个点。
         points = self._sample_evenly(contour, n_points)
 
-        # 领口锚点：用两尖中点算法（与 _extract_keypoints 一致）
-        raw_pts = contour.reshape(-1, 2)
-        neck_anchor = self._find_neck_anchor(raw_pts)
+        # 领口锚点：在上部轮廓里找最窄的横截面，避免把 hanger 顶部算进去。
+        neck_anchor = self._find_neck_anchor(mask)
         return points, mask, neck_anchor
 
     @staticmethod
-    def _find_neck_anchor(pts: np.ndarray) -> tuple[float, float]:
-        """从轮廓点中计算领口锚点（两尖中点算法）。
+    def _find_neck_anchor(mask: np.ndarray) -> tuple[float, float]:
+        """从二值 mask 中估计领口锚点。
 
-        取顶部 25% 点，按 x 中位分左右半，每半找最高点(y最小)，返回中点。
-        与 _extract_keypoints 的领口逻辑一致，但不走完整的 8 点派生流程。
+        规则：只看物体上部 30% 的高度，按行统计宽度，取最窄的横截面作为
+        领口中心。这样可以避开衣架顶部的细小挂钩，同时对白衬衫翻领、
+        旗袍高领和普通 T 恤都比“直接取最顶点”更稳。
         """
-        order = np.argsort(pts[:, 1])
-        sorted_pts = pts[order]
-        y_min = int(sorted_pts[0, 1])
-        y_max = int(sorted_pts[-1, 1])
+        ys, xs = np.where(mask > 0)
+        if len(xs) < 2:
+            return (0.0, 0.0)
+
+        y_min = int(ys.min())
+        y_max = int(ys.max())
         ch = max(y_max - y_min, 1)
-        band_bottom = int(y_min + ch * 0.25)
-        top_band = sorted_pts[sorted_pts[:, 1] <= band_bottom]
-        if len(top_band) < 2:
-            return (float(pts[:, 0].mean()), float(pts[:, 1].min()))
-        x_med = int(np.median(top_band[:, 0]))
-        left = top_band[top_band[:, 0] <= x_med]
-        right = top_band[top_band[:, 0] > x_med]
-        if len(left) == 0 or len(right) == 0:
-            return (float(top_band[:, 0].mean()), float(top_band[:, 1].max()))
-        lp = left[np.argmin(left[:, 1])]
-        rp = right[np.argmin(right[:, 1])]
-        return (float((lp[0] + rp[0]) / 2), float((lp[1] + rp[1]) / 2))
+        upper_limit = min(y_max, int(y_min + ch * 0.30))
+        if upper_limit <= y_min:
+            return (float(xs.mean()), float(ys.min()))
+
+        upper_band = mask[y_min:upper_limit + 1]
+        widths = (upper_band > 0).sum(axis=1).astype(np.float32)
+        if len(widths) >= 5:
+            kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
+            kernel /= kernel.sum()
+            widths = np.convolve(widths, kernel, mode="same")
+
+        min_idx = int(np.argmin(widths))
+        search_order = [0]
+        for delta in range(1, min(4, len(widths))):
+            search_order.extend([delta, -delta])
+
+        for offset in search_order:
+            idx = min(max(min_idx + offset, 0), len(widths) - 1)
+            row = np.where(mask[y_min + idx] > 0)[0]
+            if len(row) > 0:
+                return (float((row[0] + row[-1]) / 2), float(y_min + idx))
+
+        return (float(xs.mean()), float(y_min))
 
     @staticmethod
     def _sample_evenly(contour: np.ndarray, n_points: int) -> np.ndarray:
@@ -153,7 +166,7 @@ class ClothingDetector:
             cv2.drawContours(contour_vis, [contour], -1, (0, 255, 255), 2)
             cv2.imwrite(str(_DEBUG_DIR / "clothing_2_contour.png"), contour_vis)
 
-        return self._extract_keypoints(points, image)
+        return self._extract_keypoints(points, mask, image)
 
     @staticmethod
     def _mask_from_alpha(alpha: np.ndarray) -> np.ndarray | None:
@@ -210,14 +223,13 @@ class ClothingDetector:
         mask = cv2.erode(mask, kernel, iterations=1)
         return mask
 
-    def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
+    def _extract_keypoints(self, points: np.ndarray, mask: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
 
         不依赖固定比例，而是利用服装轮廓的几何特征：
 
-        - 领口 (top_center)：轮廓顶部附近最深的凹点
-          （圆领/V 领都是轮廓线"内陷"的位置）。
-          如果找不到凹点（例如高领无明显开口），退化为顶部中点。
+                - 领口 (top_center)：上部 30% 轮廓里最窄的横截面。
+                    这比“直接取最顶点”更不容易被衣架挂钩带偏。
         - 肩部 (left/right_shoulder)：领口往下扫描左右轮廓 x 坐标，
           第一次出现宽度明显放缓的拐点。
         - 腋下 (left/right_armpit)：肩部往下到下摆之间再次出现宽度
@@ -266,42 +278,10 @@ class ClothingDetector:
                 cv2.circle(v, (int(kp[0]), int(kp[1])), 10, (0, 0, 0), 2)
             cv2.imwrite(str(_DEBUG_DIR / f"clothing_3_{name}.png"), v)
 
-        # 1. 领口：取顶部 25% 轮廓点，按 x 中位分成左右两半，
-        # 每半找最高点（y 最小），两点中点即为领口几何中心。
-        #
-        # 无论何种领型，领口总是由左右两个"尖"界定：圆领的领口
-        # 左右边缘、立领的左右领角、翻领的左右翻领尖。取顶部 25%
-        # 足以覆盖各种领型，同时不会包含袖子（袖端在肩部以下）。
+        # 1. 领口：直接复用 mask 级别的宽度谷值规则。
         band_top = y_min
-        band_bottom = int(y_min + ch * 0.25)
-        top_band = pts_sorted[
-            (pts_sorted[:, 1] >= band_top) & (pts_sorted[:, 1] <= band_bottom)
-        ]
-        if len(top_band) < 2:
-            # 区间内点不够，退化到全图顶部中点。
-            top_band = pts_sorted[pts_sorted[:, 1] <= band_bottom]
-            neck_center = (
-                int(top_band[:, 0].mean()),
-                int(top_band[:, 1].max()),
-            )
-        else:
-            # 按 x 中位分成左右两半，每半找最高点。
-            x_med = int(np.median(top_band[:, 0]))
-            left_half = top_band[top_band[:, 0] <= x_med]
-            right_half = top_band[top_band[:, 0] > x_med]
-            if len(left_half) == 0 or len(right_half) == 0:
-                # 衣服不对称（如单侧遮挡），退化。
-                neck_center = (
-                    int(top_band[:, 0].mean()),
-                    int(top_band[:, 1].max()),
-                )
-            else:
-                left_peak = left_half[np.argmin(left_half[:, 1])]
-                right_peak = right_half[np.argmin(right_half[:, 1])]
-                neck_center = (
-                    int((left_peak[0] + right_peak[0]) // 2),
-                    int((left_peak[1] + right_peak[1]) // 2),
-                )
+        band_bottom = int(y_min + ch * 0.30)
+        neck_center = self._find_neck_anchor(mask)
         _save_step("neck", neck_center,
                    (band_top, band_bottom), (0, 0, 255))
 
