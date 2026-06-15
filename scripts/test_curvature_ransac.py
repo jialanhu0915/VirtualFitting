@@ -401,8 +401,15 @@ def run_one(cloth_path: str, human_path: str, n: int = 64) -> dict:
         print(f"  ! 特征点数量不匹配 衣={len(cloth_kpts)} 人={len(human_kpts_arr)}")
         return {"ok": False}
     H, W = human_rgb.shape[:2]
+    # 优先锚点：前 3 个 (collar / sh-L / sh-R) 是定位最准的点，
+    # 用来决定缩放/旋转/平移；waist/hem 让相似变换自由带过去。
+    pri_cloth = np.array(cloth_feats_xy[:3], dtype=np.float32)
+    pri_body = np.array(human_kpts[:3], dtype=np.float32)
     warped_rgb, warped_mask = warp_clothing(
-        cloth_rgb, cloth_mask, cloth_kpts, human_kpts_arr, (H, W))
+        cloth_rgb, cloth_mask, cloth_kpts, human_kpts_arr, (H, W),
+        clothing_priority_anchors=pri_cloth,
+        body_priority_anchors=pri_body,
+    )
     overlay = blend(human_rgb, warped_rgb, warped_mask)
     print(f"  Warp 完成: warped_mask 非零={int((warped_mask > 0).sum())} 像素")
 

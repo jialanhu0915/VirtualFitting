@@ -103,36 +103,13 @@ def _tps_warp_points(
     return mapped
 
 
-def warp_clothing(
-    clothing_rgb: np.ndarray,
-    clothing_mask: np.ndarray,
-    clothing_contour: np.ndarray,
-    body_contour: np.ndarray,
-    out_shape: tuple[int, int],
-    clothing_anchor: tuple[float, float] | None = None,
-    body_anchor: tuple[float, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
-
-    Args:
-        clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
-        clothing_mask: 衣服二值 mask (Hc, Wc)
-        clothing_contour: 衣服轮廓采样点 (n, 2)，在衣服图坐标系
-        body_contour: 人体躯干轮廓 (n, 2)，在人体图坐标系
-        out_shape: 输出图尺寸 (H, W)
-        clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
-        body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
-
-    Returns:
-        warped_rgb, warped_mask — 都对齐到 out_shape
-    """
-    n = min(len(clothing_contour), len(body_contour))
-    src_pts = clothing_contour[:n].astype(np.float32)
-    dst_pts = body_contour[:n].astype(np.float32)
-
-    H, W = out_shape
-
-    # 用外接矩形估算缩放（cover 身体区域）
+def _bbox_affine(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    clothing_anchor: tuple[float, float] | None,
+    body_anchor: tuple[float, float] | None,
+) -> np.ndarray:
+    """外接矩形缩放 + 锚点平移（兜底路径，不推荐）。"""
     sx_min, sy_min = src_pts[:, 0].min(), src_pts[:, 1].min()
     sx_max, sy_max = src_pts[:, 0].max(), src_pts[:, 1].max()
     dx_min, dy_min = dst_pts[:, 0].min(), dst_pts[:, 1].min()
@@ -143,7 +120,6 @@ def warp_clothing(
     dst_h = max(dy_max - dy_min, 1)
     scale = max(dst_w / src_w, dst_h / src_h) * 1.05
 
-    # 锚点定位：衣服领口 → 人体脖子
     if clothing_anchor is None:
         clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
     if body_anchor is None:
@@ -153,10 +129,60 @@ def warp_clothing(
     bx, by = body_anchor
     tx = bx - cx * scale
     ty = by - cy * scale
-    M_affine = np.array([
+    return np.array([
         [scale, 0, tx],
         [0, scale, ty],
     ], dtype=np.float32)
+
+
+def warp_clothing(
+    clothing_rgb: np.ndarray,
+    clothing_mask: np.ndarray,
+    clothing_contour: np.ndarray,
+    body_contour: np.ndarray,
+    out_shape: tuple[int, int],
+    clothing_anchor: tuple[float, float] | None = None,
+    body_anchor: tuple[float, float] | None = None,
+    clothing_priority_anchors: np.ndarray | None = None,
+    body_priority_anchors: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
+
+    Args:
+        clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
+        clothing_mask: 衣服二值 mask (Hc, Wc)
+        clothing_contour: 衣服轮廓采样点 (n, 2)，在衣服图坐标系
+        body_contour: 人体躯干轮廓 (n, 2)，在人体图坐标系
+        out_shape: 输出图尺寸 (H, W)
+        clothing_anchor / body_anchor: 旧版锚点（仅 fallback 路径用）
+        clothing_priority_anchors: (k, 2) 衣服上"最准的 k 个点"，≥2 即触发相似变换路径
+        body_priority_anchors: (k, 2) 人体上对应的 k 个点
+
+    Returns:
+        warped_rgb, warped_mask — 都对齐到 out_shape
+
+    缩放策略：提供 priority anchors 时，用 cv2.estimateAffinePartial2D
+    拟合相似变换（scale + rotation + translation）。该变换让最准的 k 个点
+    严格对齐，并自然推导出缩放/旋转/平移，不再受腰/摆等次要点干扰。
+    不提供时回退到 bounding-box + 锚点平移（兜底，waist/hem 不准时会偏）。
+    """
+    n = min(len(clothing_contour), len(body_contour))
+    src_pts = clothing_contour[:n].astype(np.float32)
+    dst_pts = body_contour[:n].astype(np.float32)
+    H, W = out_shape
+
+    if (clothing_priority_anchors is not None
+            and body_priority_anchors is not None
+            and len(clothing_priority_anchors) >= 2
+            and len(body_priority_anchors) >= 2):
+        src_a = np.asarray(clothing_priority_anchors, dtype=np.float32)
+        dst_a = np.asarray(body_priority_anchors, dtype=np.float32)
+        M_affine, _ = cv2.estimateAffinePartial2D(src_a, dst_a)
+        if M_affine is None:
+            # 退化（点全共线等）时回退到 bounding box
+            M_affine = _bbox_affine(src_pts, dst_pts, clothing_anchor, body_anchor)
+    else:
+        M_affine = _bbox_affine(src_pts, dst_pts, clothing_anchor, body_anchor)
 
     # 仿射 warp
     warped_rgb = cv2.warpAffine(clothing_rgb, M_affine, (W, H),
