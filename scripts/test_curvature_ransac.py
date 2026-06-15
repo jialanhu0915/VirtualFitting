@@ -186,53 +186,63 @@ def _top_curv(curv: np.ndarray, idxs: np.ndarray, want: str,
 
 
 def select_features_by_anchors(pts: np.ndarray, curv: np.ndarray, sign: np.ndarray
-                               ) -> tuple[list[int], list[str]]:
-    """衣服 5 个解剖点：collar / sh-L / sh-R / waist / hem。
+                               ) -> tuple[list[int], list[np.ndarray], list[str]]:
+    """衣服 5 个解剖点，返回 (idx, xy, names) 三元组。
 
-    人体路径改用 MediaPipe 关键点，不走本函数。
+    collar = 双肩中点（跟人体 neck 一致，避免 mask 顶端误判）
+    sh-L / sh-R = 0-0.18 H 窗口 lateral x 极值
+    waist = 0.40-0.60 H 窗口 lateral x 极值中 y 居中点
+    hem = 轮廓 y 最大点
+
+    idx 版：每个 xy 投影到最近轮廓点（collar 用双肩 y 中位投影），用于曲率图。
+    xy 版：双肩中点真正位置（collar 不在轮廓上），用于 warp。
     """
     ys = pts[:, 1]
     H = float(ys.max())
-    feats: list[tuple[int, str]] = []
+    hem_idx = int(np.argmax(ys))
+    y_hem = float(ys[hem_idx])
+    neck_idx = int(np.argmin(ys))
+    y_neck = float(ys[neck_idx])
 
-    neck = int(np.argmin(ys))
-    hem = int(np.argmax(ys))
-    y_neck = float(ys[neck])
-    y_hem = float(ys[hem])
-
-    def _band_neck(off_lo: float, off_hi: float):
+    def _band(off_lo: float, off_hi: float):
         lo = y_neck + off_lo * H
         hi = min(y_neck + off_hi * H, y_hem)
         return (ys >= lo) & (ys <= hi)
 
-    # 双肩：颈口下方 0.18 H 窗口 lateral
-    band = _band_neck(0.00, 0.18)
+    # 双肩：0-0.18 H 窗口 lateral
+    band = _band(0.00, 0.18)
     idxs = np.where(band)[0]
     if len(idxs) >= 2:
-        shoulder_l, shoulder_r = _lateral(pts, idxs)
+        sh_L_idx, sh_R_idx = _lateral(pts, idxs)
     else:
-        shoulder_l = shoulder_r = neck
+        sh_L_idx = sh_R_idx = hem_idx
+    sh_L = pts[sh_L_idx]
+    sh_R = pts[sh_R_idx]
+
+    # 领口 = 双肩中点（跟人体 neck 定义一致）
+    collar_xy = (sh_L + sh_R) / 2
 
     # 腰：0.40-0.60 H 窗口 lateral 中位点
-    band = _band_neck(0.40, 0.60)
+    band = _band(0.40, 0.60)
     idxs = np.where(band)[0]
     if len(idxs) >= 2:
         xs = pts[idxs, 0]
         y_mid = (ys[int(idxs[np.argmin(xs)])] + ys[int(idxs[np.argmax(xs)])]) / 2
-        waist = int(idxs[np.argmin(np.abs(ys[idxs] - y_mid))])
+        waist_idx = int(idxs[np.argmin(np.abs(ys[idxs] - y_mid))])
     else:
-        waist = neck
+        waist_idx = hem_idx
+    waist_xy = pts[waist_idx]
 
-    feats = [
-        (neck,        "collar"),
-        (shoulder_l,  "sh-L"),
-        (shoulder_r,  "sh-R"),
-        (waist,       "waist"),
-        (hem,         "hem"),
-    ]
-    idx_list = [f[0] for f in feats]
-    name_list = [f[1] for f in feats]
-    return idx_list, name_list
+    hem_xy = pts[hem_idx]
+
+    # collar 投影到轮廓（y 中位最近点）—— 用于曲率图绘制
+    collar_target_y = (sh_L[1] + sh_R[1]) / 2
+    collar_idx = int(np.argmin(np.abs(ys - collar_target_y)))
+
+    feats_idx = [collar_idx, sh_L_idx, sh_R_idx, waist_idx, hem_idx]
+    feats_xy = [collar_xy, sh_L, sh_R, waist_xy, hem_xy]
+    names = ["collar", "sh-L", "sh-R", "waist", "hem"]
+    return feats_idx, feats_xy, names
 
 
 # ---------- 人体 MediaPipe 关键点 ----------
@@ -371,9 +381,11 @@ def run_one(cloth_path: str, human_path: str, n: int = 64) -> dict:
         return {"ok": False}
     cloth_curv = smooth_circular(compute_curvature(cloth_pts))
     cloth_sign = compute_sign(cloth_pts)
-    cloth_feats, cloth_names = select_features_by_anchors(
+    cloth_feats_idx, cloth_feats_xy, cloth_names = select_features_by_anchors(
         cloth_pts, cloth_curv, cloth_sign)
-    print(f"  衣服特征点  {len(cloth_feats)} {cloth_names}")
+    print(f"  衣服特征点  {len(cloth_feats_idx)} {cloth_names}")
+    for name, xy in zip(cloth_names, cloth_feats_xy):
+        print(f"    {name:<6}  ({xy[0]:.1f}, {xy[1]:.1f})")
 
     # --- 人体：MediaPipe ---
     detector = RobustHumanDetector()
@@ -383,7 +395,7 @@ def run_one(cloth_path: str, human_path: str, n: int = 64) -> dict:
         print(f"    {name:<6}  ({pt[0]:.0f}, {pt[1]:.0f})")
 
     # --- 缩放覆盖（tps_warp.warp_clothing）---
-    cloth_kpts = np.array([cloth_pts[i] for i in cloth_feats], dtype=np.float32)
+    cloth_kpts = np.array(cloth_feats_xy, dtype=np.float32)
     human_kpts_arr = np.array(human_kpts, dtype=np.float32)
     if len(cloth_kpts) != len(human_kpts_arr):
         print(f"  ! 特征点数量不匹配 衣={len(cloth_kpts)} 人={len(human_kpts_arr)}")
@@ -400,7 +412,8 @@ def run_one(cloth_path: str, human_path: str, n: int = 64) -> dict:
         "human_rgb": human_rgb,
         "cloth_mask": cloth_mask,
         "cloth_pts": cloth_pts,
-        "cloth_feats": cloth_feats,
+        "cloth_feats": cloth_feats_xy,   # (x, y) 浮点对
+        "cloth_feats_idx": cloth_feats_idx,  # 轮廓 idx（用于曲率图）
         "cloth_names": cloth_names,
         "cloth_curv": cloth_curv,
         "cloth_sign": cloth_sign,
@@ -426,12 +439,14 @@ def visualize(diag: dict, save_path: Path) -> None:
 
     # 1. 衣服 + 5 个解剖点
     axes[0, 0].imshow(cloth_rgb)
-    axes[0, 0].scatter(cloth_pts[cloth_feats, 0], cloth_pts[cloth_feats, 1],
+    feat_xs = [pt[0] for pt in cloth_feats]
+    feat_ys = [pt[1] for pt in cloth_feats]
+    axes[0, 0].scatter(feat_xs, feat_ys,
                        c="red", s=80, marker="o", edgecolors="white", linewidths=1.5)
     axes[0, 0].plot(cloth_pts[:, 0], cloth_pts[:, 1], "-", color="cyan",
                     alpha=0.4, linewidth=1)
-    for i, name in zip(cloth_feats, diag["cloth_names"]):
-        axes[0, 0].annotate(name, (cloth_pts[i, 0], cloth_pts[i, 1]),
+    for pt, name in zip(cloth_feats, diag["cloth_names"]):
+        axes[0, 0].annotate(name, (pt[0], pt[1]),
                              xytext=(8, -4), textcoords="offset points",
                              fontsize=8, color="red", fontweight="bold")
     axes[0, 0].set_title(f"衣服 + {len(cloth_feats)} 特征点")
@@ -504,6 +519,7 @@ def save_intermediates(diag: dict) -> list[Path]:
     cloth_mask = diag["cloth_mask"]
     cloth_pts = diag["cloth_pts"]
     cloth_feats = diag["cloth_feats"]
+    cloth_feats_idx = diag["cloth_feats_idx"]
     cloth_curv = diag["cloth_curv"]
     cloth_sign = diag["cloth_sign"]
     human_kpts = diag["human_kpts"]
@@ -553,7 +569,7 @@ def save_intermediates(diag: dict) -> list[Path]:
                     where=convex_mask, color="red", alpha=0.4, label="凸")
     ax.fill_between(np.arange(len(cloth_curv)), 0, cloth_curv,
                     where=concave_mask, color="blue", alpha=0.4, label="凹")
-    for i, name in zip(cloth_feats, diag["cloth_names"]):
+    for i, name in zip(cloth_feats_idx, diag["cloth_names"]):
         col = "red" if cloth_sign[i] > 0 else "blue"
         ax.axvline(i, color=col, linestyle="--", linewidth=0.8, alpha=0.6)
         ax.scatter([i], [cloth_curv[i]], color=col, s=60, zorder=5,
@@ -561,7 +577,7 @@ def save_intermediates(diag: dict) -> list[Path]:
         ax.annotate(name, (i, cloth_curv[i]),
                     xytext=(4, 6), textcoords="offset points",
                     fontsize=8, color=col, fontweight="bold")
-    ax.set_title(f"衣服 曲率  ({len(cloth_feats)} 特征点)")
+    ax.set_title(f"衣服 曲率  ({len(cloth_feats_idx)} 特征点)")
     ax.set_ylabel("曲率")
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(alpha=0.3)
@@ -572,7 +588,7 @@ def save_intermediates(diag: dict) -> list[Path]:
                     where=convex_mask, color="red", alpha=0.5, label="凸 (+1)")
     ax.fill_between(np.arange(len(cloth_curv)), 0, sign_norm,
                     where=concave_mask, color="blue", alpha=0.5, label="凹 (-1)")
-    for i in cloth_feats:
+    for i in cloth_feats_idx:
         col = "red" if cloth_sign[i] > 0 else "blue"
         ax.axvline(i, color=col, linestyle="--", linewidth=0.8, alpha=0.6)
     ax.set_title("衣服 凸/凹符号")
@@ -591,10 +607,10 @@ def save_intermediates(diag: dict) -> list[Path]:
 
     # 05 衣服特征点（cv2 英文标注）+ 人体 MediaPipe 关键点（matplotlib 标注）
     cloth_feat_img = cloth_rgb.copy()
-    for i, name in zip(cloth_feats, diag["cloth_names"]):
-        x, y = cloth_pts[i]
-        cv2.circle(cloth_feat_img, (int(x), int(y)), 12, (0, 255, 0), 3)
-        cv2.putText(cloth_feat_img, name, (int(x) + 14, int(y) - 6),
+    for pt, name in zip(cloth_feats, diag["cloth_names"]):
+        x, y = int(pt[0]), int(pt[1])
+        cv2.circle(cloth_feat_img, (x, y), 12, (0, 255, 0), 3)
+        cv2.putText(cloth_feat_img, name, (x + 14, y - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     human_kp_img = human_rgb.copy()
     for pt, name in zip(human_kpts, diag["human_names"]):
@@ -611,7 +627,7 @@ def save_intermediates(diag: dict) -> list[Path]:
 
     # 06 对应关系可视化（5↔5 确定性对应）
     match_img = human_rgb.copy()
-    src = np.array([cloth_pts[i] for i in cloth_feats], dtype=np.float32)
+    src = np.array(cloth_feats, dtype=np.float32)
     dst = np.array(human_kpts, dtype=np.float32)
     for k_m in range(len(src)):
         cv2.line(match_img, tuple(src[k_m].astype(int)),
