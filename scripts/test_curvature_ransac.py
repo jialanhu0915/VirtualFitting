@@ -26,9 +26,12 @@ from virtual_tryon.human_detector import RobustHumanDetector, body_region_contou
 from virtual_tryon.io import ensure_dir, load_image
 from virtual_tryon.tps_warp import blend, warp_clothing
 
-OUT = ensure_dir(Path(__file__).resolve().parent.parent / "output" / "curvature_ransac")
-CLOTHING = "data_picture/clothes/image.png"
+OUT_BASE = ensure_dir(Path(__file__).resolve().parent.parent / "output" / "curvature_ransac")
+# 命令行第一个参数为衣服路径；不传则用 image.png
+CLOTHING = sys.argv[1] if len(sys.argv) > 1 else "data_picture/clothes/image.png"
 HUMAN = "data_picture/people/image.png"
+# 每件衣服一个子目录，避免互相覆盖
+OUT = ensure_dir(OUT_BASE / Path(CLOTHING).stem)
 
 
 # ---------- 边缘检测（与 clothing_detector._segment_edge 同款） ----------
