@@ -63,7 +63,8 @@ def _run_human(person_path: Path, out_dir: Path) -> dict[str, Keypoint]:
 
 
 def _run_clothing(
-    clothing_path: Path, out_dir: Path, method: str = "geometric",
+    clothing_path: Path, out_dir: Path,
+    method: str = "geometric", mask_postprocess: bool = True,
 ) -> dict[str, Keypoint]:
     """加载服装图、设置 debug 目录、跑 ClothingDetector、保存可视化。"""
     # 服装图可能带 alpha 通道（PNG 透明背景），用 with_alpha 保留。
@@ -71,8 +72,11 @@ def _run_clothing(
     debug_dir = ensure_dir(out_dir / "debug")
     set_clothing_debug(debug_dir)
     try:
-        clothing_det = ClothingDetector(keypoint_method=method)
-        logger.info("正在检测服装关键点（method=%s）：%s", method, clothing_path)
+        clothing_det = ClothingDetector(
+            keypoint_method=method, mask_postprocess=mask_postprocess,
+        )
+        logger.info("正在检测服装关键点（method=%s, mask_postprocess=%s）：%s",
+                    method, mask_postprocess, clothing_path)
         kpts = clothing_det.detect(clothing_img)
     finally:
         set_clothing_debug(None)
@@ -95,7 +99,10 @@ def cmd_detect_human(args: argparse.Namespace) -> int:
 def cmd_detect_clothing(args: argparse.Namespace) -> int:
     """`detect-clothing` 子命令：只检测服装关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
-    _run_clothing(args.clothing, out_dir, method=args.method)
+    _run_clothing(
+        args.clothing, out_dir,
+        method=args.method, mask_postprocess=args.mask_postprocess,
+    )
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -104,7 +111,10 @@ def cmd_detect(args: argparse.Namespace) -> int:
     """`detect` 子命令：同时检测人体和服装关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
     _run_human(args.person, out_dir)
-    _run_clothing(args.clothing, out_dir, method=args.method)
+    _run_clothing(
+        args.clothing, out_dir,
+        method=args.method, mask_postprocess=args.mask_postprocess,
+    )
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -127,7 +137,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     body_pts = body_region_contour(human_kpts, n_points=args.n_points)
 
     # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
-    clothing_det = ClothingDetector(keypoint_method=args.method)
+    clothing_det = ClothingDetector(
+        keypoint_method=args.method, mask_postprocess=args.mask_postprocess,
+    )
     clothing_pts, clothing_mask, cloth_anchor = clothing_det.sample_contour(
         clothing_img, n_points=args.n_points,
     )
@@ -194,6 +206,11 @@ def main() -> int:
                          choices=["geometric", "width"],
                          help="关键点派生方法：geometric=V1宽度谷值+极值（默认）；"
                               "width=V3宽度剖面自适应")
+    p_det_c.add_argument(
+        "--mask-postprocess", dest="mask_postprocess",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="是否对 mask 做基础后处理（默认启用，--no-mask-postprocess 关闭）",
+    )
     p_det_c.set_defaults(func=cmd_detect_clothing)
 
     p_det_h = sub.add_parser(
@@ -214,6 +231,11 @@ def main() -> int:
     p_run.add_argument("--method", default="geometric",
                        choices=["geometric", "width"],
                        help="服装关键点派生方法")
+    p_run.add_argument(
+        "--mask-postprocess", dest="mask_postprocess",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="是否对 mask 做基础后处理（默认启用，--no-mask-postprocess 关闭）",
+    )
     p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()

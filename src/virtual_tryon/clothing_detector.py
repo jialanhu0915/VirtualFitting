@@ -42,12 +42,27 @@ class ClothingDetector:
         RuntimeError: 找不到合格的服装轮廓时抛出。
     """
 
-    def __init__(self, keypoint_method: str = "geometric") -> None:
+    def __init__(
+        self,
+        keypoint_method: str = "geometric",
+        mask_postprocess: bool = True,
+    ) -> None:
+        """初始化检测器。
+
+        Args:
+            keypoint_method: 关键点派生方法。
+                "geometric"=V1 几何派生（默认，固定比例带+极值扫描）。
+                "width"=V3 宽度剖面法。
+            mask_postprocess: 是否对 _segment_edge() 输出的 mask 做基础后处理
+                （闭运算→最大连通分量→填洞→边缘腐蚀 1px）。默认 True。
+                关闭后可对照观察后处理对下游关键点的影响。
+        """
         if keypoint_method not in ("geometric", "width"):
             raise ValueError(
                 f"keypoint_method 必须是 'geometric' 或 'width'，收到 {keypoint_method!r}"
             )
         self.keypoint_method = keypoint_method
+        self.mask_postprocess = mask_postprocess
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
@@ -66,6 +81,15 @@ class ClothingDetector:
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mask = self._segment_edge(rgb)
+
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_1_mask_raw.png"), mask)
+
+        if self.mask_postprocess:
+            mask = self.clean_mask(mask)
+
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_1_mask.png"), mask)
 
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -141,6 +165,14 @@ class ClothingDetector:
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mask = self._segment_edge(rgb)
+
+        # 保存原始 mask，便于对照后处理效果
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_1_mask_raw.png"), mask)
+
+        # 基础后处理
+        if self.mask_postprocess:
+            mask = self.clean_mask(mask)
 
         # 把分割掩码落盘，便于调试分割质量。
         if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
@@ -222,6 +254,46 @@ class ClothingDetector:
         # 紧贴衣服实际边缘，避免 warp 后透出白底产生白边。
         mask = cv2.erode(mask, kernel, iterations=1)
         return mask
+
+    @staticmethod
+    def clean_mask(mask: np.ndarray) -> np.ndarray:
+        """对分割 mask 做基础后处理：闭运算→最大连通分量→填洞→边缘腐蚀。
+
+        针对 CLAHE+Canny 分割在白底/阴影场景下常见的三类问题：
+        1. Canny 边缘经闭运算后残留小孔/小洞 → 第 1 步闭运算+第 3 步填洞修复。
+        2. Canny 抓到远处散点噪声 → 第 2 步最大连通分量过滤。
+        3. Canny 边界 overshoot 撑大 mask → 第 4 步腐蚀 1px 回收。
+
+        不会处理"mask 包含大面积连通阴影"的情况（连通分量救不了，
+        那是另一类问题——见 docs/notes/v3-width-profile-experiment.md）。
+
+        Args:
+            mask: 二值前景 mask (H, W)，dtype=uint8。
+
+        Returns:
+            清理后的 mask，与输入同形状同 dtype。
+        """
+        if mask is None or mask.max() == 0:
+            return mask
+        # 1. 闭运算：填 Canny 抓出来的小洞，连小段
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # 2. 最大连通分量：去 Canny 抓到的远处散点噪声
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+        if n > 1:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            largest = (labels == largest_label).astype(np.uint8) * 255
+        else:
+            largest = closed
+        # 3. 填洞：连通域内部可能被 Canny 漏掉的边缘切成小孔
+        contours, _ = cv2.findContours(
+            largest, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        filled = np.zeros_like(largest)
+        cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+        # 4. 边缘腐蚀 1 像素：去 Canny 边界 overshoot 撑出来的"光晕"外延
+        eroded = cv2.erode(filled, np.ones((3, 3), np.uint8), iterations=1)
+        return eroded
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
