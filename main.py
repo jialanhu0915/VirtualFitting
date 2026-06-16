@@ -24,10 +24,12 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from virtual_tryon import ClothingDetector, Keypoint, RobustHumanDetector
-from virtual_tryon.human_detector import (
-    body_region_contour,
-    set_debug_dir as set_human_debug,
+from virtual_tryon.human_cache import (
+    cache_paths_for,
+    load_human_cache,
+    save_human_cache,
 )
+from virtual_tryon.human_detector import body_region_contour
 from virtual_tryon.clothing_detector import set_debug_dir as set_clothing_debug
 from virtual_tryon.io import ensure_dir, load_image, save_image
 from virtual_tryon.tps_warp import blend, warp_clothing
@@ -43,17 +45,35 @@ def _dump_keypoints(label: str, kpts: dict[str, Keypoint]) -> None:
         logger.info("  %-18s (%4d, %4d)  conf=%.2f", k, v.x, v.y, v.confidence)
 
 
-def _run_human(person_path: Path, out_dir: Path) -> dict[str, Keypoint]:
-    """加载人体图、设置 debug 目录、跑 RobustHumanDetector、保存可视化。"""
+def _load_or_detect_human(
+    person_path: str | Path, force_rebuild: bool = False,
+) -> dict[str, Keypoint]:
+    """优先读本地缓存的人体关键点；命中失败或强制重建时跑模型并写缓存。
+
+    缓存文件位于 person 图像同目录（`*.keypoints.json` + `*.keypoints.jpg`），
+    失效条件由 human_cache.load_human_cache 判断（mtime 不一致等）。
+    """
+    person_path = Path(person_path)
+    if not force_rebuild:
+        cached = load_human_cache(person_path)
+        if cached is not None:
+            logger.info("命中人体关键点缓存：%s", person_path)
+            return cached
+
+    logger.info("运行人体检测器：%s", person_path)
     person_img = load_image(person_path)
-    debug_dir = ensure_dir(out_dir / "debug")
-    set_human_debug(debug_dir)
-    try:
-        human_det = RobustHumanDetector()
-        logger.info("正在检测人体关键点：%s", person_path)
-        kpts = human_det.detect(person_img)
-    finally:
-        set_human_debug(None)
+    kpts = RobustHumanDetector().detect(person_img)
+    save_human_cache(person_path, kpts, draw_keypoints(person_img, kpts))
+    return kpts
+
+
+def _run_human(
+    person_path: str | Path, out_dir: Path, force_rebuild: bool = False,
+) -> dict[str, Keypoint]:
+    """加载人体图（优先用缓存）、保存可视化到 out_dir。"""
+    person_path = Path(person_path)
+    kpts = _load_or_detect_human(person_path, force_rebuild=force_rebuild)
+    person_img = load_image(person_path)
     save_image(
         out_dir / "human_keypoints.jpg",
         draw_keypoints(person_img, kpts),
@@ -85,7 +105,7 @@ def _run_clothing(clothing_path: Path, out_dir: Path) -> dict[str, Keypoint]:
 def cmd_detect_human(args: argparse.Namespace) -> int:
     """`detect-human` 子命令：只检测人体关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
-    _run_human(args.person, out_dir)
+    _run_human(args.person, out_dir, force_rebuild=args.rebuild_human_cache)
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -101,9 +121,17 @@ def cmd_detect_clothing(args: argparse.Namespace) -> int:
 def cmd_detect(args: argparse.Namespace) -> int:
     """`detect` 子命令：同时检测人体和服装关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
-    _run_human(args.person, out_dir)
+    _run_human(args.person, out_dir, force_rebuild=args.rebuild_human_cache)
     _run_clothing(args.clothing, out_dir)
     logger.info("输出已写入 %s", out_dir)
+    return 0
+
+
+def cmd_cache_human(args: argparse.Namespace) -> int:
+    """`cache-human` 子命令：显式预热/重建人体关键点缓存。"""
+    _load_or_detect_human(args.person, force_rebuild=True)
+    json_path, jpg_path = cache_paths_for(Path(args.person))
+    logger.info("人体关键点缓存已就绪：%s / %s", json_path, jpg_path)
     return 0
 
 
@@ -111,18 +139,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     """`run` 子命令：完整虚拟试衣流水线。"""
     out_dir = ensure_dir(args.output)
 
-    # 1. 加载图像
+    # 1. 加载人体关键点（命中缓存则跳过模型）
+    human_kpts = _load_or_detect_human(
+        args.person, force_rebuild=args.rebuild_human_cache,
+    )
     person_img = load_image(args.person)
+    body_pts = body_region_contour(human_kpts, n_points=args.n_points)
+
+    # 2. 加载衣服
     clothing_img = load_image(args.clothing, with_alpha=True)
     if clothing_img.shape[2] == 4:
         clothing_rgb = clothing_img[:, :, :3]
     else:
         clothing_rgb = clothing_img
-
-    # 2. 人体检测 → 躯干区域轮廓
-    human_det = RobustHumanDetector()
-    human_kpts = human_det.detect(person_img)
-    body_pts = body_region_contour(human_kpts, n_points=args.n_points)
 
     # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
     clothing_det = ClothingDetector()
@@ -181,6 +210,10 @@ def main() -> int:
     p_det.add_argument("--person", required=True, help="人体图像路径")
     p_det.add_argument("--clothing", required=True, help="服装图像路径")
     p_det.add_argument("--output", default="output", help="输出目录")
+    p_det.add_argument(
+        "--rebuild-human-cache", action="store_true",
+        help="忽略人体关键点缓存，强制重新跑模型",
+    )
     p_det.set_defaults(func=cmd_detect)
 
     p_det_c = sub.add_parser(
@@ -195,7 +228,18 @@ def main() -> int:
     )
     p_det_h.add_argument("--person", required=True, help="人体图像路径")
     p_det_h.add_argument("--output", default="output", help="输出目录")
+    p_det_h.add_argument(
+        "--rebuild-human-cache", action="store_true",
+        help="忽略人体关键点缓存，强制重新跑模型",
+    )
     p_det_h.set_defaults(func=cmd_detect_human)
+
+    p_cache_h = sub.add_parser(
+        "cache-human",
+        help="预热/重建人体关键点缓存（写入 person 图同目录）",
+    )
+    p_cache_h.add_argument("--person", required=True, help="人体图像路径")
+    p_cache_h.set_defaults(func=cmd_cache_human)
 
     p_run = sub.add_parser(
         "run", help="完整虚拟试衣流水线（轮廓采样 → TPS 变形 → 融合）"
@@ -205,6 +249,10 @@ def main() -> int:
     p_run.add_argument("--output", default="output/run", help="输出目录")
     p_run.add_argument("--n-points", type=int, default=30,
                        help="轮廓采样点数（默认 30）")
+    p_run.add_argument(
+        "--rebuild-human-cache", action="store_true",
+        help="忽略人体关键点缓存，强制重新跑模型",
+    )
     p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()

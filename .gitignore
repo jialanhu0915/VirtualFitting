@@ -13,6 +13,10 @@ wheels/
 output/
 models/
 
+# Human keypoint cache (regenerated from source images)
+*.keypoints.json
+*.keypoints.jpg
+
 # Local editor / tool config
 .vscode/
 .idea/
