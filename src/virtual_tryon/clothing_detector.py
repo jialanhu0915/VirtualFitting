@@ -46,6 +46,7 @@ class ClothingDetector:
         self,
         keypoint_method: str = "geometric",
         mask_postprocess: bool = True,
+        mask_trim_solidity: bool = False,
     ) -> None:
         """初始化检测器。
 
@@ -55,7 +56,10 @@ class ClothingDetector:
                 "width"=V3 宽度剖面法。
             mask_postprocess: 是否对 _segment_edge() 输出的 mask 做基础后处理
                 （闭运算→最大连通分量→填洞→边缘腐蚀 1px）。默认 True。
-                关闭后可对照观察后处理对下游关键点的影响。
+            mask_trim_solidity: 是否对 clean_mask() 输出的 mask 进一步做行向实心度
+                剪枝，裁掉底部阴影。**默认 False**——T 恤等长款衣服上
+                会让 V1 误把领口当肩（详见
+                docs/notes/mask-postprocess-experiment.md）。
         """
         if keypoint_method not in ("geometric", "width"):
             raise ValueError(
@@ -63,6 +67,7 @@ class ClothingDetector:
             )
         self.keypoint_method = keypoint_method
         self.mask_postprocess = mask_postprocess
+        self.mask_trim_solidity = mask_trim_solidity
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
@@ -87,6 +92,9 @@ class ClothingDetector:
 
         if self.mask_postprocess:
             mask = self.clean_mask(mask)
+
+        if self.mask_postprocess and self.mask_trim_solidity:
+            mask = self._trim_by_row_solidity(mask)
 
         if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
             cv2.imwrite(str(_DEBUG_DIR / "clothing_1_mask.png"), mask)
@@ -173,6 +181,10 @@ class ClothingDetector:
         # 基础后处理
         if self.mask_postprocess:
             mask = self.clean_mask(mask)
+
+        # 行向实心度剪枝：裁掉底部阴影行
+        if self.mask_postprocess and self.mask_trim_solidity:
+            mask = self._trim_by_row_solidity(mask)
 
         # 把分割掩码落盘，便于调试分割质量。
         if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
@@ -294,6 +306,84 @@ class ClothingDetector:
         # 4. 边缘腐蚀 1 像素：去 Canny 边界 overshoot 撑出来的"光晕"外延
         eroded = cv2.erode(filled, np.ones((3, 3), np.uint8), iterations=1)
         return eroded
+
+    @staticmethod
+    def _trim_by_row_solidity(mask: np.ndarray, threshold: float = 0.9) -> np.ndarray:
+        """用行向实心度剪枝裁掉 mask 底部阴影行。
+
+        衣服本体的每行 mask 应当是高度连续的（实心度 ≈ 1），
+        底部阴影在 mask 里通常分裂成多段，实心度显著低。
+        本方法找最长的"高实心度连续 y 段"，保留这个段内的 mask，
+        其余清零。
+
+        实心度定义：solidity[y] = max_run_len(y) / span(y)，
+        其中 span = xmax - xmin，max_run 是该行 mask 像素的最长连续段长度。
+        实心度高 ⇒ 该行被 1 段连续 mask 主导 ⇒ 衣服本体；
+        实心度低 ⇒ 该行是碎片（阴影/水印）⇒ 应裁掉。
+
+        threshold 取 0.9 的原因：clean_mask() 的填洞步骤会修复一部分
+        碎片，导致"body+shadow 混合区"的实心度回升到 0.6~0.8
+        （不再是 0.17 的纯阴影）。用 0.9 才能把这种"被填洞撑高"的
+        混合区跟纯身体（实心度 1.0）区分开。
+
+        Args:
+            mask: 二值 mask (H, W)。
+            threshold: 实心度阈值，0~1。低于此值的行视为碎片。
+                默认 0.9。
+
+        Returns:
+            裁剪后的 mask，与输入同形状同 dtype。
+        """
+        h = mask.shape[0]
+        solidity = np.zeros(h, dtype=np.float32)
+        for y in range(h):
+            xs = np.where(mask[y] > 0)[0]
+            if len(xs) < 2:
+                continue
+            span = int(xs.max() - xs.min())
+            if span == 0:
+                solidity[y] = 1.0
+                continue
+            # 找最长连续段（mask 是 0/255 二值）
+            max_run = 1
+            cur_run = 1
+            for i in range(1, len(xs)):
+                if xs[i] == xs[i - 1] + 1:
+                    cur_run += 1
+                    if cur_run > max_run:
+                        max_run = cur_run
+                else:
+                    cur_run = 1
+            solidity[y] = max_run / span
+
+        # 找最长连续高实心度 y 段
+        in_band = solidity > threshold
+        if not in_band.any():
+            return mask  # 没有高实心度行，整图就是碎的，不裁
+        best_end, best_len = 0, 0
+        cur_start, cur_len = None, 0
+        for y in range(h):
+            if in_band[y]:
+                if cur_start is None:
+                    cur_start = y
+                    cur_len = 1
+                else:
+                    cur_len += 1
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_end = y
+            else:
+                cur_start = None
+                cur_len = 0
+        # 高实心度段太短（< 30% 图高），可能图本身就是稀碎的，不裁
+        if best_len < h * 0.30:
+            return mask
+        # 只裁底不裁顶：保留 band 起点以上的所有原 mask（包括领口/衣领），
+        # 只清掉 band 终点以下（阴影行）。这样 V1 的领口锚点不会被
+        # 强行挪到 band 起点。
+        out = mask.copy()
+        out[best_end + 1:] = 0
+        return out
 
     def _extract_keypoints(self, points: np.ndarray, image: np.ndarray) -> dict[str, Keypoint]:
         """从轮廓点集自适应派生 8 个关键点。
