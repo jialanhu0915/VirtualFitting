@@ -40,12 +40,17 @@ class ClothingDetector:
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
-    ) -> tuple[np.ndarray, np.ndarray, tuple[float, float]]:
+    ) -> tuple[np.ndarray, np.ndarray, tuple[float, float], dict[str, Keypoint]]:
         """从服装图中提取轮廓并均匀采样 n_points 个点，同时返回 mask 和领口锚点。
 
         Returns:
-            (points, mask, neck_anchor): points 是 (n_points, 2) int32 采样坐标，
-            mask 是二值前景掩码。
+            (points, mask, neck_anchor, keypoints):
+            - points: (n_points, 2) int32 弧长均匀采样坐标
+            - mask: 二值前景掩码
+            - neck_anchor: 领口锚点 (x, y)
+            - keypoints: 8 个语义关键点 dict（top_center / shoulders /
+              armpits / bottoms / bottom_center），按 keypoints.py 的
+              CLOTHING_KEYPOINTS 命名
         """
         if image.ndim == 3 and image.shape[2] == 4:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
@@ -63,13 +68,14 @@ class ClothingDetector:
             raise RuntimeError("未找到服装轮廓")
         contour = max(contours, key=cv2.contourArea)
 
-        # 按弧长均匀采样 n_points 个点。
+        # 按弧长均匀采样 n_points 个点（用于 affine 等需要密集采样的路径）。
         points = self._sample_evenly(contour, n_points)
 
-        # 领口锚点：用两尖中点算法（与 _extract_keypoints 一致）
+        # 领口锚点 + 8 个语义关键点：都用未采样的原始轮廓，弧长采样会丢峰谷。
         raw_pts = contour.reshape(-1, 2)
         neck_anchor = self._find_neck_anchor(raw_pts)
-        return points, mask, neck_anchor
+        keypoints = self._extract_keypoints(raw_pts, image)
+        return points, mask, neck_anchor, keypoints
 
     @staticmethod
     def _find_neck_anchor(pts: np.ndarray) -> tuple[float, float]:

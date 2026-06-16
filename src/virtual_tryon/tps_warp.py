@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# _tps_warp_dense 的分块大小：每块像素数 = 5 万，对应 ~224x224 的小方阵。
+# 控制点 n=30 时单块内存峰值 ~24MB，足够 4K 图也不会爆。
+_TPS_CHUNK_SIZE = 50_000
 
 
 def _align_contours(
@@ -103,6 +108,99 @@ def _tps_warp_points(
     return mapped
 
 
+def _tps_warp_dense(
+    src_ctl: np.ndarray,
+    w_x: np.ndarray, w_y: np.ndarray,
+    a_x: np.ndarray, a_y: np.ndarray,
+    out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """TPS 稠密 warp：把 out_shape 内每个像素从 src_ctl 空间映射到 dst 空间。
+
+    与 _tps_warp_points 的区别：本函数对整张输出图一次性算映射场，
+    整块算会爆内存（n=30, H*W=80万时 U 矩阵 ~192MB），所以按
+    _TPS_CHUNK_SIZE 分块；块内整组向量化，无 Python 循环。
+
+    Args:
+        src_ctl: TPS 控制点 (n, 2)，必须与 _tps_coefficients 的 src 一致。
+        w_x, w_y, a_x, a_y: _tps_coefficients 返回的系数。
+        out_shape: 输出图尺寸 (H, W)。
+
+    Returns:
+        (map_x, map_y) 形状均为 (H, W) float32，可直接喂给 cv2.remap。
+    """
+    H, W = out_shape
+    grid_y, grid_x = np.mgrid[0:H, 0:W]
+    flat = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1).astype(np.float64)
+    M = flat.shape[0]
+
+    out = np.empty((M, 2), dtype=np.float32)
+    src_x = src_ctl[:, 0]
+    src_y = src_ctl[:, 1]
+    for start in range(0, M, _TPS_CHUNK_SIZE):
+        end = min(start + _TPS_CHUNK_SIZE, M)
+        chunk = flat[start:end]                          # (k, 2)
+        dx = chunk[:, 0:1] - src_x[np.newaxis, :]        # (k, n)
+        dy = chunk[:, 1:2] - src_y[np.newaxis, :]
+        r2 = dx * dx + dy * dy
+        with np.errstate(divide="ignore", invalid="ignore"):
+            U = np.where(r2 > 1e-12, 0.5 * r2 * np.log(r2 + 1e-12), 0.0)
+        out[start:end, 0] = (
+            a_x[0] + a_x[1] * chunk[:, 0] + a_x[2] * chunk[:, 1] + U @ w_x
+        )
+        out[start:end, 1] = (
+            a_y[0] + a_y[1] * chunk[:, 0] + a_y[2] * chunk[:, 1] + U @ w_y
+        )
+
+    return out[:, 0].reshape(H, W).astype(np.float32), \
+           out[:, 1].reshape(H, W).astype(np.float32)
+
+
+def _warp_tps(
+    clothing_rgb: np.ndarray,
+    clothing_mask: np.ndarray,
+    semantic_pairs: np.ndarray,
+    out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """用 8 对语义关键点做 TPS warp。
+
+    与早期版本的区别：早期用 30 个 arc-length 采样点做"对应"，
+    但弧长第 i 个点在语义上不对应（衣服第 8 个点是袖口、人体第 8
+    个点是肩下），TPS 强行拉扯会扭曲袖子。本版本用 8 对语义点
+    （领口↔颈、肩↔肩、腋下↔肘、下摆↔髋 + 底中点↔髋中点），
+    由 CORRESPONDENCE 字典给出，语义一一对应。
+
+    Args:
+        clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
+        clothing_mask: 衣服二值 mask (Hc, Wc)
+        semantic_pairs: (n, 2, 2) 数组，semantic_pairs[i, 0] 是衣服关键点
+            （衣服图坐标系），semantic_pairs[i, 1] 是人体关键点（人体图坐标系）。
+        out_shape: 输出图尺寸 (H, W)
+
+    Returns:
+        warped_rgb, warped_mask — 都对齐到 out_shape
+    """
+    pairs = semantic_pairs.astype(np.float64)
+    src = pairs[:, 0, :]   # clothing 坐标
+    dst = pairs[:, 1, :]   # body 坐标
+
+    # 系数以 dst 为 src_ctl：f(body 坐标) -> clothing 坐标。
+    w_x, w_y, a_x, a_y = _tps_coefficients(dst, src)
+    map_x, map_y = _tps_warp_dense(dst, w_x, w_y, a_x, a_y, out_shape)
+
+    warped_rgb = cv2.remap(
+        clothing_rgb, map_x, map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    # mask 用最近邻保持二值性，理由同 TPS 路径注释。
+    warped_mask = cv2.remap(
+        clothing_mask, map_x, map_y,
+        cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped_rgb, warped_mask
+
+
 def warp_clothing(
     clothing_rgb: np.ndarray,
     clothing_mask: np.ndarray,
@@ -111,6 +209,8 @@ def warp_clothing(
     out_shape: tuple[int, int],
     clothing_anchor: tuple[float, float] | None = None,
     body_anchor: tuple[float, float] | None = None,
+    method: str = "affine",
+    semantic_pairs: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
 
@@ -122,10 +222,22 @@ def warp_clothing(
         out_shape: 输出图尺寸 (H, W)
         clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
         body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
+        method: ``"affine"``（默认）只做等比缩放+对齐；``"tps"`` 用 semantic_pairs
+            提供的语义对应点做薄板样条非线性形变。
+        semantic_pairs: (n, 2, 2) 数组，semantic_pairs[i, 0] 是衣服点、
+            semantic_pairs[i, 1] 是对应人体点。仅 method="tps" 时必填。
 
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
     """
+    if method == "tps":
+        if semantic_pairs is None:
+            raise ValueError("method='tps' 需要提供 semantic_pairs")
+        return _warp_tps(
+            clothing_rgb, clothing_mask,
+            cast(np.ndarray, semantic_pairs), out_shape,
+        )
+
     n = min(len(clothing_contour), len(body_contour))
     src_pts = clothing_contour[:n].astype(np.float32)
     dst_pts = body_contour[:n].astype(np.float32)

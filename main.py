@@ -32,6 +32,7 @@ from virtual_tryon.human_cache import (
 from virtual_tryon.human_detector import body_region_contour
 from virtual_tryon.clothing_detector import set_debug_dir as set_clothing_debug
 from virtual_tryon.io import ensure_dir, load_image, save_image
+from virtual_tryon.keypoints import CORRESPONDENCE
 from virtual_tryon.tps_warp import blend, warp_clothing
 from virtual_tryon.visualize import draw_keypoints
 
@@ -153,10 +154,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         clothing_rgb = clothing_img
 
-    # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
+    # 3. 衣服轮廓采样（同时得到 mask、领口锚点、8 个语义关键点）
     clothing_det = ClothingDetector()
-    clothing_pts, clothing_mask, cloth_anchor = clothing_det.sample_contour(
-        clothing_img, n_points=args.n_points,
+    clothing_pts, clothing_mask, cloth_anchor, cloth_8kpts = (
+        clothing_det.sample_contour(clothing_img, n_points=args.n_points)
     )
 
     # 用 mask 抠掉衣服背景
@@ -171,13 +172,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     neck_offset = max(0.0, (neck_y - nose_y) * 0.30)
     body_anchor = (neck_x, neck_y - neck_offset)
 
-    # 4. 仿射变形（领口 → 脖子锚定）
-    logger.info("正在进行仿射变形（领口→脖子锚定）...")
+    # 4. 变形（领口 → 脖子锚定；method=tps 时用 TPS 路径，anchor 被忽略）
+    logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)
+
+    # 8 对语义对应：按 CORRESPONDENCE 把衣服点 → 人体点。
+    # CORRESPONDENCE 没列 bottom_center，用左右髋中点补齐，使配对数和
+    # 衣服关键点数一致。
+    semantic_pairs: np.ndarray | None = None
+    if args.warp_method == "tps":
+        pairs: list[list[list[float]]] = []
+        for cloth_name, human_name in CORRESPONDENCE.items():
+            ck = cloth_8kpts[cloth_name]
+            hk = human_kpts[human_name]
+            pairs.append([[float(ck.x), float(ck.y)], [float(hk.x), float(hk.y)]])
+        # bottom_center -> (left_hip, right_hip) 中点
+        bc = cloth_8kpts["bottom_center"]
+        lh, rh = human_kpts["left_hip"], human_kpts["right_hip"]
+        pairs.append([
+            [float(bc.x), float(bc.y)],
+            [(lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0],
+        ])
+        semantic_pairs = np.array(pairs, dtype=np.float32)
+        logger.info("TPS 语义对应点数：%d", len(pairs))
+
     warped_rgb, warped_mask = warp_clothing(
         clothing_fg, clothing_mask, clothing_pts, body_pts,
         out_shape=person_img.shape[:2],
         clothing_anchor=cloth_anchor,
         body_anchor=body_anchor,
+        method=args.warp_method,
+        semantic_pairs=semantic_pairs,
     )
 
     # 5. 融合
@@ -252,6 +276,10 @@ def main() -> int:
     p_run.add_argument(
         "--rebuild-human-cache", action="store_true",
         help="忽略人体关键点缓存，强制重新跑模型",
+    )
+    p_run.add_argument(
+        "--warp-method", choices=["affine", "tps"], default="affine",
+        help="warp 算法：affine=等比缩放+对齐（默认），tps=薄板样条非线性形变",
     )
     p_run.set_defaults(func=cmd_run)
 

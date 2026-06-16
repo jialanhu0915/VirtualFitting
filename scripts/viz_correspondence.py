@@ -33,7 +33,7 @@ for clothing_name in ["image.png", "image2.jpg"]:
 
     # 衣服
     clothing_det = ClothingDetector()
-    c_pts, c_mask, c_anchor = clothing_det.sample_contour(clothing_img, n_points=30)
+    c_pts, c_mask, c_anchor, c_kpts = clothing_det.sample_contour(clothing_img, n_points=30)
 
     # ---- 仿射矩阵（与 warp_clothing 一致）----
     src_pts = c_pts.astype(np.float32)

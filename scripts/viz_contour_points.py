@@ -29,7 +29,7 @@ for clothing_name in ["image.png", "image2.jpg"]:
 
     # 衣服轮廓点
     clothing_det = ClothingDetector()
-    c_pts, c_mask, c_anchor = clothing_det.sample_contour(clothing_img, n_points=30)
+    c_pts, c_mask, c_anchor, c_kpts = clothing_det.sample_contour(clothing_img, n_points=30)
 
     # ---- 图1: 人体图 + 身体轮廓点 ----
     vis_h = person_img.copy()
