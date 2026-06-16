@@ -39,11 +39,70 @@ from virtual_tryon.visualize import draw_keypoints
 logger = logging.getLogger(__name__)
 
 
+# 进入 TPS 时排除下摆 → 髋的强对应：衣服下摆通常远低于髋（旗袍到脚踝），
+# 强对应会把下半身压缩到髋高度。剔除后下摆按 TPS 的远距离仿射行为自然下垂。
+_TPS_EXCLUDED_CORRESPONDENCE: set[str] = {"left_bottom", "right_bottom"}
+
+
 def _dump_keypoints(label: str, kpts: dict[str, Keypoint]) -> None:
     """以表格形式打印关键点坐标和置信度。"""
     logger.info("%s 关键点（共 %d 个）：", label, len(kpts))
     for k, v in kpts.items():
         logger.info("  %-18s (%4d, %4d)  conf=%.2f", k, v.x, v.y, v.confidence)
+
+
+def _cover_outpush(
+    body_pt: np.ndarray, cloth_pt: np.ndarray,
+    neck: np.ndarray, hip_mid: np.ndarray,
+    cloth_anchor: np.ndarray, scale: float,
+) -> np.ndarray:
+    """覆盖性外推：消除"人体关节中心 vs 衣服轮廓边缘"的几何错配。
+
+    人体关键点是关节中心、衣服关键点是轮廓边缘，直接做 TPS 控制点会把衣服
+    收缩到骨架尺寸（旗袍尤其明显）。这里把 dst（人体侧）沿身体中轴的法向
+    外推到至少和 affine 预测一样外，保证衣服 warp 后能覆盖人体；
+    切向（沿中轴方向）保留人体姿态偏差，让 TPS 仍能拟合一肩高一肩低、
+    抬手等非线性形变——这是 TPS 相对 affine 的核心优势，不能丢。
+
+    Args:
+        body_pt: 人体侧关键点（关节中心，会被外推的 dst）
+        cloth_pt: 衣服侧关键点（轮廓边缘，TPS 的 src）
+        neck: 人体颈中点（中轴起点 + affine 平移锚点）
+        hip_mid: 人体髋中点（中轴终点）
+        cloth_anchor: 衣服领中点（affine 平移锚点，对应 neck）
+        scale: affine 的均匀缩放比
+
+    Returns:
+        外推后的 dst (2,) float32
+    """
+    # affine 预测：衣服点按 (scale, anchor=top_center→neck) 变换后的位置
+    p_aff = neck + scale * (cloth_pt - cloth_anchor)
+
+    # 身体中轴（neck → hip_mid）的单位向量和法向
+    axis = hip_mid - neck
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-6:
+        # 退化（neck 和 hip_mid 重合）：放弃外推，原样返回。
+        return body_pt.astype(np.float32)
+    axis_u = axis / axis_norm
+    perp_u = np.array([-axis_u[1], axis_u[0]], dtype=np.float32)
+
+    # 把 body_pt 和 p_aff 都分解到中轴坐标系（以 neck 为原点）
+    body_rel = body_pt - neck
+    aff_rel = p_aff - neck
+    body_axial = float(body_rel @ axis_u)
+    body_perp = float(body_rel @ perp_u)
+    aff_perp = float(aff_rel @ perp_u)
+
+    # 切向：完全保留 body（保留姿态偏差，TPS 的非线性能力在此体现）
+    target_axial = body_axial
+    # 法向：同侧时取更外的，异侧时保守用 body（衣服比人体窄的罕见 case）
+    if (body_perp >= 0) == (aff_perp >= 0):
+        target_perp = body_perp if abs(body_perp) > abs(aff_perp) else aff_perp
+    else:
+        target_perp = body_perp
+
+    return (neck + target_axial * axis_u + target_perp * perp_u).astype(np.float32)
 
 
 def _load_or_detect_human(
@@ -175,25 +234,71 @@ def cmd_run(args: argparse.Namespace) -> int:
     # 4. 变形（领口 → 脖子锚定；method=tps 时用 TPS 路径，anchor 被忽略）
     logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)
 
-    # 8 对语义对应：按 CORRESPONDENCE 把衣服点 → 人体点。
-    # CORRESPONDENCE 没列 bottom_center，用左右髋中点补齐，使配对数和
-    # 衣服关键点数一致。
+    # TPS 控制点构造：
+    # - 排除 *_bottom（下摆 → 髋强对应会把长款衣服压到髋高度）
+    # - top_center → neck 作为中线锚点，**不外推**（领中点和 neck 都在中线）
+    # - 其余 4 对（左右肩、左右腋下）的 dst 用 _cover_outpush 做覆盖性外推，
+    #   消除"关节中心 vs 轮廓边缘"的几何错配（详见函数 docstring）
     semantic_pairs: np.ndarray | None = None
     if args.warp_method == "tps":
+        # affine 参考变换：领口 → neck 为锚点，scale 取衣服 5 个上半身语义点
+        # 和对应人体点外接矩形的 max(W/w, H/h)，保证衣服 cover 上半身。
+        cloth_anchor_pt = np.array(
+            [cloth_8kpts["top_center"].x, cloth_8kpts["top_center"].y],
+            dtype=np.float32,
+        )
+        neck_pt = np.array(
+            [human_kpts["neck"].x, human_kpts["neck"].y], dtype=np.float32,
+        )
+        hip_mid_pt = np.array([
+            (human_kpts["left_hip"].x + human_kpts["right_hip"].x) / 2.0,
+            (human_kpts["left_hip"].y + human_kpts["right_hip"].y) / 2.0,
+        ], dtype=np.float32)
+
+        # scale：复用 affine 路径同款公式（轮廓 bbox 的 max(W/w, H/h)），
+        # 而不是用 5 个稀疏语义点。语义点里 armpit↔elbow 不是"几何锚定"
+        # 而是"穿上后大致到肘"的近似，纳入 bbox 会把 scale 拉偏（实测
+        # 旗袍上算出 scale<1 导致外推全 no-op）。轮廓 bbox 反映整件衣服
+        # vs 整个躯干区域的尺寸比，和 affine 路径里的 scale 含义一致，
+        # 在"实测能 cover"这点上已被验证。
+        cw = max(float(np.ptp(clothing_pts[:, 0])), 1.0)
+        ch = max(float(np.ptp(clothing_pts[:, 1])), 1.0)
+        bw = max(float(np.ptp(body_pts[:, 0])), 1.0)
+        bh = max(float(np.ptp(body_pts[:, 1])), 1.0)
+        affine_scale = max(bw / cw, bh / ch) * 1.05
+
         pairs: list[list[list[float]]] = []
         for cloth_name, human_name in CORRESPONDENCE.items():
+            if cloth_name in _TPS_EXCLUDED_CORRESPONDENCE:
+                continue
             ck = cloth_8kpts[cloth_name]
             hk = human_kpts[human_name]
-            pairs.append([[float(ck.x), float(ck.y)], [float(hk.x), float(hk.y)]])
-        # bottom_center -> (left_hip, right_hip) 中点
-        bc = cloth_8kpts["bottom_center"]
-        lh, rh = human_kpts["left_hip"], human_kpts["right_hip"]
-        pairs.append([
-            [float(bc.x), float(bc.y)],
-            [(lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0],
-        ])
+            cloth_pt = np.array([ck.x, ck.y], dtype=np.float32)
+            body_pt = np.array([hk.x, hk.y], dtype=np.float32)
+
+            if cloth_name == "top_center":
+                # 领 → neck 作为中线锚点，不外推
+                dst_pt = body_pt
+            else:
+                dst_pt = _cover_outpush(
+                    body_pt, cloth_pt, neck_pt, hip_mid_pt,
+                    cloth_anchor_pt, affine_scale,
+                )
+            pairs.append([
+                [float(cloth_pt[0]), float(cloth_pt[1])],
+                [float(dst_pt[0]), float(dst_pt[1])],
+            ])
+            if cloth_name != "top_center":
+                logger.info(
+                    "  外推 %-14s body=(%.0f,%.0f) → dst=(%.0f,%.0f)",
+                    cloth_name, body_pt[0], body_pt[1], dst_pt[0], dst_pt[1],
+                )
+
         semantic_pairs = np.array(pairs, dtype=np.float32)
-        logger.info("TPS 语义对应点数：%d", len(pairs))
+        logger.info(
+            "TPS 语义对应点数：%d（affine 参考 scale=%.3f）",
+            len(pairs), affine_scale,
+        )
 
     warped_rgb, warped_mask = warp_clothing(
         clothing_fg, clothing_mask, clothing_pts, body_pts,
