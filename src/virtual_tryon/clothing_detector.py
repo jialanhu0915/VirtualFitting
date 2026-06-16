@@ -7,6 +7,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.ndimage import convolve
+from skimage.morphology import skeletonize
 
 from .keypoints import Keypoint
 
@@ -34,9 +36,20 @@ class ClothingDetector:
     取最大外轮廓后，按轮廓几何特征自适应派生 8 个关键点
     （领口凹点、肩部/腋下左右极值、下摆左右端点内缩）。
 
+    Attributes:
+        keypoint_method: 关键点派生方法，"geometric"（V1，凹点+极值），
+            "skeleton"（V2，骨架分叉+对称轴+曲率融合）。
+
     Raises:
         RuntimeError: 找不到合格的服装轮廓时抛出。
     """
+
+    def __init__(self, keypoint_method: str = "geometric") -> None:
+        if keypoint_method not in ("geometric", "skeleton"):
+            raise ValueError(
+                f"keypoint_method 必须是 'geometric' 或 'skeleton'，收到 {keypoint_method!r}"
+            )
+        self.keypoint_method = keypoint_method
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
@@ -153,6 +166,8 @@ class ClothingDetector:
             cv2.drawContours(contour_vis, [contour], -1, (0, 255, 255), 2)
             cv2.imwrite(str(_DEBUG_DIR / "clothing_2_contour.png"), contour_vis)
 
+        if self.keypoint_method == "skeleton":
+            return self._extract_keypoints_skeleton(points, mask, image)
         return self._extract_keypoints(points, image)
 
     @staticmethod
@@ -382,3 +397,398 @@ class ClothingDetector:
         left = band[np.argmin(band[:, 0])]
         right = band[np.argmax(band[:, 0])]
         return (int(left[0]), int(left[1])), (int(right[0]), int(right[1]))
+
+    # ============================================================
+    # V2: 骨架 + 对称轴 + 轮廓曲率 融合关键点
+    # ============================================================
+
+    @staticmethod
+    def _find_symmetry_axis(mask: np.ndarray) -> float:
+        """求 mask 的垂直对称轴 x 坐标。
+
+        对每一行取左右像素的中点，整个 mask 的中点中位数就是对称轴 x。
+        大部分衣服左右对称，对称轴天然穿过领口中心、底摆中点，
+        可以作为 V1 "宽度谷值"的稳定 fallback 信号。
+        """
+        h, w = mask.shape
+        midpoints: list[float] = []
+        for y in range(h):
+            xs = np.where(mask[y] > 0)[0]
+            if len(xs) >= 2:
+                midpoints.append((int(xs[0]) + int(xs[-1])) / 2.0)
+        if not midpoints:
+            return w / 2.0
+        return float(np.median(midpoints))
+
+    @staticmethod
+    def _skeleton_features(
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """提取 mask 的骨架并按邻域像素数分类为端点/分叉/普通。
+
+        Returns:
+            (skeleton, junctions, endpoints) 都是 bool 数组，shape 与 mask 相同。
+            - skeleton: 所有骨架像素
+            - junctions: 骨架分叉点（≥3 个邻居），通常对应腋下/领口分叉
+            - endpoints: 骨架端点（恰好 1 个邻居），通常对应领口尖端/下摆
+        """
+        skel_bool = skeletonize(mask > 127)
+        # 3x3 邻域计数（中心点不算）
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        kernel[1, 1] = 0
+        nb = convolve(skel_bool.astype(np.uint8), kernel, mode="constant", cval=0)
+        endpoints = skel_bool & (nb == 1)
+        junctions = skel_bool & (nb >= 3)
+        return skel_bool, junctions, endpoints
+
+    @staticmethod
+    def _contour_curvature(contour: np.ndarray) -> np.ndarray:
+        """沿闭合轮廓计算每点的曲率（带符号）。
+
+        约定：凸角（外凸）为正，凹角（内凹）为负。
+        使用 5 点中心差分；首尾循环连接。
+        """
+        pts = contour.reshape(-1, 2).astype(np.float64)
+        n = len(pts)
+        if n < 5:
+            return np.zeros(n)
+
+        # 用循环索引取邻居
+        idx = np.arange(n)
+        x_prev = pts[(idx - 2) % n, 0]
+        x_curr = pts[idx, 0]
+        x_next = pts[(idx + 2) % n, 0]
+        y_prev = pts[(idx - 2) % n, 1]
+        y_curr = pts[idx, 1]
+        y_next = pts[(idx + 2) % n, 1]
+
+        # 一阶导数
+        dx = (x_next - x_prev) / 4.0
+        dy = (y_next - y_prev) / 4.0
+        # 二阶导数
+        ddx = (x_next - 2 * x_curr + x_prev) / 4.0
+        ddy = (y_next - 2 * y_curr + y_prev) / 4.0
+
+        denom = (dx * dx + dy * dy) ** 1.5
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curv = np.where(denom > 1e-6, (dx * ddy - dy * ddx) / denom, 0.0)
+        return curv
+
+    def _curvature_extrema_in_band(
+        self,
+        contour: np.ndarray,
+        y_lo: int,
+        y_hi: int,
+        x_sym: float,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """在 y 区间内找曲率绝对值最大的左右一对点。
+
+        适合检测肩峰（凸角）和腋下 V（凹角）这类轮廓转角。
+        返回 ((left_x, left_y), (right_x, right_y))，按 x 排序。
+        """
+        pts_sorted = contour.reshape(-1, 2)
+        band_mask = (pts_sorted[:, 1] >= y_lo) & (pts_sorted[:, 1] <= y_hi)
+        band_pts = pts_sorted[band_mask]
+        if len(band_pts) < 5:
+            return None
+
+        # 在整个 contour 上算曲率，再索引回 band
+        curv = self._contour_curvature(contour)
+        band_curv = curv[band_mask]
+        if len(band_curv) == 0:
+            return None
+        abs_curv = np.abs(band_curv)
+
+        # 左侧：x < x_sym 的点里取 |曲率| 最大
+        left_mask = band_pts[:, 0] < x_sym
+        right_mask = band_pts[:, 0] >= x_sym
+        if not left_mask.any() or not right_mask.any():
+            return None
+
+        left_idx = np.argmax(np.where(left_mask, abs_curv, -1.0))
+        right_idx = np.argmax(np.where(right_mask, abs_curv, -1.0))
+
+        return (
+            (int(band_pts[left_idx, 0]), int(band_pts[left_idx, 1])),
+            (int(band_pts[right_idx, 0]), int(band_pts[right_idx, 1])),
+        )
+
+    @staticmethod
+    def _find_symmetric_pair(
+        peaks: list[tuple[int, float]],
+        contour: np.ndarray,
+        x_sym: float,
+        y_lo: int,
+        y_hi: int,
+        exclude_idx: int | None = None,
+        max_try: int = 12,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """从曲率极值候选里挑最强的左右对称一对。
+
+        Args:
+            peaks: 候选列表 [(contour_idx, strength), ...]，按强度降序。
+            contour: (n, 2) 轮廓点。
+            x_sym: 对称轴 x 坐标。
+            y_lo, y_hi: y 区间。
+            exclude_idx: 排除的索引（避免和已分配的关键点重复）。
+            max_try: 只在前 max_try 个候选里搜索配对。
+
+        评分：strength 之和 - 0.1*|y1-y2| - 0.05*|到 x_sym 距离之差|。
+        排除规则：两点必须分列 x_sym 两侧。
+        """
+        cands = [
+            (idx, s) for (idx, s) in peaks[:max_try]
+            if idx != exclude_idx
+            and y_lo <= int(contour[idx, 1]) <= y_hi
+        ]
+        best = None
+        best_score = float("-inf")
+        for i in range(len(cands)):
+            for j in range(i + 1, len(cands)):
+                i1, s1 = cands[i]
+                i2, s2 = cands[j]
+                y1, y2 = float(contour[i1, 1]), float(contour[i2, 1])
+                x1, x2 = float(contour[i1, 0]), float(contour[i2, 0])
+                # 必须左右分列
+                if not ((x1 < x_sym) != (x2 < x_sym)):
+                    continue
+                y_diff = abs(y1 - y2)
+                sym_diff = abs(abs(x1 - x_sym) - abs(x2 - x_sym))
+                score = s1 + s2 - 0.10 * y_diff - 0.05 * sym_diff
+                if score > best_score:
+                    best_score = score
+                    best = (i1, i2)
+        if best is None:
+            return None
+        i1, i2 = best
+        p1 = (int(contour[i1, 0]), int(contour[i1, 1]))
+        p2 = (int(contour[i2, 0]), int(contour[i2, 1]))
+        # 按 x 排序：左点在前
+        if p1[0] > p2[0]:
+            p1, p2 = p2, p1
+        return p1, p2
+
+    def _extract_keypoints_skeleton(
+        self, points: np.ndarray, mask: np.ndarray, image: np.ndarray,
+    ) -> dict[str, Keypoint]:
+        """V2: 对称轴 + 轮廓曲率 + 宽度谷值 融合的关键点派生。
+
+        设计动机：V1 在 V 形翻领衬衫上失败（详见 docs/notes/...）。
+        V2 用两个互补信号：
+            1. 领口：宽度谷值行（V1 稳定的部分）+ 骨架端点投票。
+            2. 肩/腋/下摆：轮廓曲率 NMS 找所有结构转角，按"凸点对/凹点对"
+               配对，再按 y 区间分配。比 V1 的固定比例带更鲁棒——只要衣服
+               在那几个位置有转角，曲率就会冒尖，与长宽比/款式无关。
+            3. 下摆中心：对称轴 x_sym 直接落在 y_max 行上。
+
+        每个角色都有 V1 几何方法的 fallback。
+        """
+        ys_all, _ = np.where(mask > 0)
+        if len(ys_all) == 0:
+            raise RuntimeError("mask 为空，无法提取关键点")
+        y_min, y_max = int(ys_all.min()), int(ys_all.max())
+        ch = max(y_max - y_min, 1)
+
+        x_sym = self._find_symmetry_axis(mask)
+
+        # 1. 整条轮廓的曲率
+        contour = points.reshape(-1, 2)
+        n = len(contour)
+        if n < 8:
+            return self._extract_keypoints(points, image)
+        curv = self._contour_curvature(contour)
+
+        # 2. NMS 找凸/凹点候选
+        nms_window = max(5, n // 12)
+        convex_peaks: list[tuple[int, float]] = []  # (idx, strength)
+        concave_peaks: list[tuple[int, float]] = []
+        for i in range(n):
+            is_max = is_min = True
+            c_i = curv[i]
+            for di in range(-nms_window, nms_window + 1):
+                if di == 0:
+                    continue
+                j = (i + di) % n
+                c_j = curv[j]
+                if c_j > c_i:
+                    is_max = False
+                if c_j < c_i:
+                    is_min = False
+            if is_max and c_i > 0:
+                convex_peaks.append((i, float(c_i)))
+            elif is_min and c_i < 0:
+                concave_peaks.append((i, float(-c_i)))
+        convex_peaks.sort(key=lambda x: -x[1])
+        concave_peaks.sort(key=lambda x: -x[1])
+
+        # ---- 调试可视化 ----
+        vis = None
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            vis = (image if image.shape[2] == 3
+                   else cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)).copy()
+            cv2.line(vis, (int(x_sym), 0), (int(x_sym), vis.shape[0]),
+                     (200, 200, 0), 1)
+            # 凸点（蓝）/凹点（红）
+            for idx, _ in convex_peaks[:30]:
+                cv2.circle(vis, (int(contour[idx, 0]), int(contour[idx, 1])),
+                           4, (255, 100, 0), -1)
+            for idx, _ in concave_peaks[:30]:
+                cv2.circle(vis, (int(contour[idx, 0]), int(contour[idx, 1])),
+                           4, (0, 100, 255), -1)
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_v2_0_curv.png"), vis)
+
+        # ---- top_center：上半区域最强凹点 ----
+        # 用宽度谷值行作为"高度锚点"：通常谷值行 ≈ 领口高度。
+        widths = (mask > 0).sum(axis=1).astype(np.float32)
+        upper_limit = min(y_max, int(y_min + ch * 0.35))
+        if upper_limit > y_min and (upper_limit - y_min) >= 4:
+            wu = widths[y_min:upper_limit + 1].copy()
+            k = np.array([1, 2, 3, 2, 1], dtype=np.float32); k /= k.sum()
+            wu = np.convolve(wu, k, mode="same")
+            neck_row = int(np.argmin(wu)) + y_min
+        else:
+            neck_row = y_min
+
+        top_center: tuple[int, int] | None = None
+        # 领口必须在 (a) 接近 neck_row ±容差、(b) 上半 40% 内、(c) 接近 x_sym
+        # 三者同时满足；任一不满足则回退到 (b)+(c)，再不行回退到 V1。
+        y_tol = max(int(ch * 0.06), 25)
+        # 领口到对称轴的容许偏差：取 mask 顶部 5% 的平均宽度的一半
+        upper_w = widths[y_min:min(y_max + 1, y_min + max(int(ch * 0.05), 5))]
+        x_tol = max(int(upper_w.mean() * 0.6), 30) if len(upper_w) else 80
+
+        # 第一优先：neck_row 附近 + 接近 x_sym
+        for idx, _ in concave_peaks:
+            cx, cy = int(contour[idx, 0]), int(contour[idx, 1])
+            if (abs(cy - neck_row) <= y_tol
+                    and cy <= y_min + ch * 0.40
+                    and abs(cx - x_sym) <= x_tol):
+                top_center = (cx, cy)
+                break
+        # 第二优先：上半 35% + 接近 x_sym
+        if top_center is None:
+            for idx, _ in concave_peaks:
+                cx, cy = int(contour[idx, 0]), int(contour[idx, 1])
+                if cy <= y_min + ch * 0.35 and abs(cx - x_sym) <= x_tol:
+                    top_center = (cx, cy)
+                    break
+        # 第三优先：neck_row 行 mask 中点（最稳定的领口 y 高度）
+        if top_center is None:
+            row_xs = np.where(mask[neck_row] > 0)[0]
+            if len(row_xs) > 0:
+                top_center = (int(round((row_xs[0] + row_xs[-1]) / 2)), neck_row)
+        # 极端 fallback：V1
+        if top_center is None:
+            v1_neck = self._find_neck_anchor(mask)
+            top_center = (int(v1_neck[0]), int(v1_neck[1]))
+        top_idx = None  # 不再用 top_idx 做排除，因为轮廓点索引和位置无关
+
+        # ---- bottom_center：对称轴 + 底边 ----
+        bottom_center = (int(round(x_sym)), y_max)
+
+        # ---- shoulders：上半 10%~50% 内的最强凸点对 ----
+        # 从 top_idx 之下开始找，确保不和领口凹点重复
+        sh_y_top = int(top_center[1] + ch * 0.05)
+        sh_y_bot = int(y_min + ch * 0.50)
+        shoulder_pair = self._find_symmetric_pair(
+            convex_peaks, contour, x_sym, sh_y_top, sh_y_bot,
+        )
+        if shoulder_pair is not None:
+            left_shoulder, right_shoulder = shoulder_pair
+        else:
+            # Fallback：V1 band extrema
+            band_top = int(top_center[1] + ch * 0.10)
+            band_bot = int(top_center[1] + ch * 0.30)
+            ls, rs = ClothingDetector._left_right_extrema(
+                points, band_top, band_bot,
+            )
+            left_shoulder, right_shoulder = ls, rs
+
+        # ---- armpits：肩膀 y 之下到 70% 内的最强凹点对 ----
+        sh_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        ar_y_top = int(sh_mid_y + ch * 0.03)
+        ar_y_bot = int(y_min + ch * 0.70)
+        armpit_pair = self._find_symmetric_pair(
+            concave_peaks, contour, x_sym, ar_y_top, ar_y_bot,
+            exclude_idx=top_idx,
+        )
+        if armpit_pair is not None:
+            left_armpit, right_armpit = armpit_pair
+        else:
+            # Fallback A：V1 宽度收窄行
+            widths_band = widths[ar_y_top:ar_y_bot + 1]
+            if len(widths_band) >= 5:
+                k = np.array([1, 2, 3, 2, 1], dtype=np.float32); k /= k.sum()
+                widths_band_s = np.convolve(widths_band, k, mode="same")
+                narrow_row = int(np.argmin(widths_band_s)) + ar_y_top
+                row_xs = np.where(mask[narrow_row] > 0)[0]
+                if len(row_xs) > 0:
+                    left_armpit = (int(row_xs[0]), narrow_row)
+                    right_armpit = (int(row_xs[-1]), narrow_row)
+                else:
+                    left_armpit, right_armpit = ClothingDetector._left_right_extrema(
+                        points, ar_y_top, ar_y_bot,
+                    )
+            else:
+                left_armpit, right_armpit = ClothingDetector._left_right_extrema(
+                    points, ar_y_top, ar_y_bot,
+                )
+
+        # ---- bottom corners：底部 5% 内的最强凸点对 ----
+        bm_y_top = int(y_max - ch * 0.10)
+        bottom_pair = self._find_symmetric_pair(
+            convex_peaks, contour, x_sym, bm_y_top, y_max,
+        )
+        if bottom_pair is not None:
+            lb_raw, rb_raw = bottom_pair
+            bw = rb_raw[0] - lb_raw[0]
+            inset = int(bw * 0.08)
+            left_bottom = (lb_raw[0] + inset, y_max)
+            right_bottom = (rb_raw[0] - inset, y_max)
+        else:
+            # Fallback：V1 band extrema
+            band_top = int(y_max - ch * 0.05)
+            lb_raw, rb_raw = ClothingDetector._left_right_extrema(
+                points, band_top, y_max,
+            )
+            bw = rb_raw[0] - lb_raw[0]
+            inset = int(bw * 0.08)
+            left_bottom = (lb_raw[0] + inset, y_max)
+            right_bottom = (rb_raw[0] - inset, y_max)
+
+        # ---- 调试可视化：标注最终 8 点 ----
+        if vis is not None and _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            v = vis.copy()
+            colors = {
+                "top_center": (0, 0, 255),
+                "bottom_center": (0, 255, 255),
+                "left_shoulder": (255, 0, 0),
+                "right_shoulder": (0, 0, 255),
+                "left_armpit": (255, 100, 0),
+                "right_armpit": (0, 100, 255),
+                "left_bottom": (255, 0, 255),
+                "right_bottom": (255, 255, 0),
+            }
+            for name, pt in [
+                ("top_center", top_center), ("bottom_center", bottom_center),
+                ("left_shoulder", left_shoulder), ("right_shoulder", right_shoulder),
+                ("left_armpit", left_armpit), ("right_armpit", right_armpit),
+                ("left_bottom", left_bottom), ("right_bottom", right_bottom),
+            ]:
+                cv2.circle(v, pt, 10, colors[name], -1)
+                cv2.circle(v, pt, 10, (0, 0, 0), 2)
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_v2_final.png"), v)
+
+        def mk(name: str, p: tuple[int, int]) -> Keypoint:
+            return Keypoint(int(p[0]), int(p[1]), name=name)
+
+        return {
+            "top_center":     mk("top_center",     top_center),
+            "bottom_center":  mk("bottom_center",  bottom_center),
+            "left_shoulder":  mk("left_shoulder",  left_shoulder),
+            "right_shoulder": mk("right_shoulder", right_shoulder),
+            "left_armpit":    mk("left_armpit",    left_armpit),
+            "right_armpit":   mk("right_armpit",   right_armpit),
+            "left_bottom":    mk("left_bottom",    left_bottom),
+            "right_bottom":   mk("right_bottom",   right_bottom),
+        }

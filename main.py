@@ -62,15 +62,17 @@ def _run_human(person_path: Path, out_dir: Path) -> dict[str, Keypoint]:
     return kpts
 
 
-def _run_clothing(clothing_path: Path, out_dir: Path) -> dict[str, Keypoint]:
+def _run_clothing(
+    clothing_path: Path, out_dir: Path, method: str = "geometric",
+) -> dict[str, Keypoint]:
     """加载服装图、设置 debug 目录、跑 ClothingDetector、保存可视化。"""
     # 服装图可能带 alpha 通道（PNG 透明背景），用 with_alpha 保留。
     clothing_img = load_image(clothing_path, with_alpha=True)
     debug_dir = ensure_dir(out_dir / "debug")
     set_clothing_debug(debug_dir)
     try:
-        clothing_det = ClothingDetector()
-        logger.info("正在检测服装关键点：%s", clothing_path)
+        clothing_det = ClothingDetector(keypoint_method=method)
+        logger.info("正在检测服装关键点（method=%s）：%s", method, clothing_path)
         kpts = clothing_det.detect(clothing_img)
     finally:
         set_clothing_debug(None)
@@ -93,7 +95,7 @@ def cmd_detect_human(args: argparse.Namespace) -> int:
 def cmd_detect_clothing(args: argparse.Namespace) -> int:
     """`detect-clothing` 子命令：只检测服装关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
-    _run_clothing(args.clothing, out_dir)
+    _run_clothing(args.clothing, out_dir, method=args.method)
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -102,7 +104,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
     """`detect` 子命令：同时检测人体和服装关键点并保存可视化。"""
     out_dir = ensure_dir(args.output)
     _run_human(args.person, out_dir)
-    _run_clothing(args.clothing, out_dir)
+    _run_clothing(args.clothing, out_dir, method=args.method)
     logger.info("输出已写入 %s", out_dir)
     return 0
 
@@ -125,7 +127,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     body_pts = body_region_contour(human_kpts, n_points=args.n_points)
 
     # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
-    clothing_det = ClothingDetector()
+    clothing_det = ClothingDetector(keypoint_method=args.method)
     clothing_pts, clothing_mask, cloth_anchor = clothing_det.sample_contour(
         clothing_img, n_points=args.n_points,
     )
@@ -188,6 +190,10 @@ def main() -> int:
     )
     p_det_c.add_argument("--clothing", required=True, help="服装图像路径")
     p_det_c.add_argument("--output", default="output", help="输出目录")
+    p_det_c.add_argument("--method", default="geometric",
+                         choices=["geometric", "skeleton"],
+                         help="关键点派生方法：geometric=V1凹点+极值（默认）；"
+                              "skeleton=V2骨架+对称+曲率融合")
     p_det_c.set_defaults(func=cmd_detect_clothing)
 
     p_det_h = sub.add_parser(
@@ -205,6 +211,9 @@ def main() -> int:
     p_run.add_argument("--output", default="output/run", help="输出目录")
     p_run.add_argument("--n-points", type=int, default=30,
                        help="轮廓采样点数（默认 30）")
+    p_run.add_argument("--method", default="geometric",
+                       choices=["geometric", "skeleton"],
+                       help="服装关键点派生方法")
     p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
