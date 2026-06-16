@@ -34,9 +34,20 @@ class ClothingDetector:
     取最大外轮廓后，按轮廓几何特征自适应派生 8 个关键点
     （领口凹点、肩部/腋下左右极值、下摆左右端点内缩）。
 
+    Attributes:
+        keypoint_method: 关键点派生方法，"geometric"（V1，宽度谷值 + 极值），
+            "width"（V3，宽度剖面自适应：上半 argmax 肩部 / 肩部之下 argmin 腋下）。
+
     Raises:
         RuntimeError: 找不到合格的服装轮廓时抛出。
     """
+
+    def __init__(self, keypoint_method: str = "geometric") -> None:
+        if keypoint_method not in ("geometric", "width"):
+            raise ValueError(
+                f"keypoint_method 必须是 'geometric' 或 'width'，收到 {keypoint_method!r}"
+            )
+        self.keypoint_method = keypoint_method
 
     def sample_contour(
         self, image: np.ndarray, n_points: int = 30,
@@ -153,6 +164,8 @@ class ClothingDetector:
             cv2.drawContours(contour_vis, [contour], -1, (0, 255, 255), 2)
             cv2.imwrite(str(_DEBUG_DIR / "clothing_2_contour.png"), contour_vis)
 
+        if self.keypoint_method == "width":
+            return self._extract_keypoints_width(points, mask, image)
         return self._extract_keypoints(points, image)
 
     @staticmethod
@@ -382,3 +395,210 @@ class ClothingDetector:
         left = band[np.argmin(band[:, 0])]
         right = band[np.argmax(band[:, 0])]
         return (int(left[0]), int(left[1])), (int(right[0]), int(right[1]))
+
+    # ============================================================
+    # V3: 宽度剖面法（width profile analysis）
+    # ============================================================
+
+    def _extract_keypoints_width(
+        self, points: np.ndarray, mask: np.ndarray, image: np.ndarray,
+    ) -> dict[str, Keypoint]:
+        """V3: 宽度剖面法自适应关键点。
+
+        核心思想：衣服轮廓在每个 y 行的水平跨度 width(y) 是一条曲线，
+        肩部对应上半的宽度极大值，腋下对应肩部之下的宽度极小值。V1 用
+        固定比例带（12%~22% 等）选 y 区间，V3 完全交给曲线本身的极值决定。
+
+        优势（相对 V1）：
+            - 不假设"肩在 15%、腋在 40%"。长裙、超短款、宽袍等极端长宽比
+              仍能正确定位。
+            - 对 T 恤、衬衫、旗袍、背心等都基于同一物理信号
+              （轮廓宽度变化），不依赖轮廓转角。
+
+        实现细节：
+            1. 用 `connectedComponents` 只保留最大连通分量，避免水印、
+               阴影等污染把宽度剖面带偏。
+            2. 在最大分量上重算 contour 和宽度。
+
+        信号分工：
+            - 肩部 y：上半 60% 区间内 widths 平滑后的 argmax。
+            - 腋下 y：[肩部 y + 3%, y_min + 70%] 区间内 widths 的 argmin。
+            - 顶/底：沿用 V1 宽度谷值 + 极值的成熟逻辑。
+            - 关键点 x：落在选定的 y 行，contour 左右极值。
+
+        退化：V3 内部多处回退到 V1 的 _left_right_extrema。
+        """
+        # `points` 当前未直接使用——V3 内部从 clean_mask 重算 clean_contour
+        # 以避免 mask 阴影/水印污染。保留参数仅为签名对称。
+        del points
+        ys_all, _ = np.where(mask > 0)
+        if len(ys_all) == 0:
+            raise RuntimeError("mask 为空，无法提取关键点")
+        y_min, y_max = int(ys_all.min()), int(ys_all.max())
+        ch = max(y_max - y_min, 1)
+        h_img = mask.shape[0]
+
+        # 1. 提最大连通分量，去掉阴影/水印的污染
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8,
+        )
+        if num_labels > 1:
+            # label 0 是背景，跳过
+            sizes = stats[1:, cv2.CC_STAT_AREA]
+            largest = 1 + int(np.argmax(sizes))
+            clean_mask = (labels == largest).astype(np.uint8) * 255
+        else:
+            clean_mask = mask
+        # 2. 在 clean_mask 上重算最大外轮廓
+        contours, _ = cv2.findContours(
+            clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if not contours:
+            raise RuntimeError("连通分量清洗后未找到轮廓")
+        clean_contour = max(contours, key=cv2.contourArea)
+        clean_points = clean_contour.reshape(-1, 2)
+
+        # 3. 从 clean contour 算宽度剖面
+        contour_xs = clean_points[:, 0]
+        contour_ys = clean_points[:, 1]
+        row_x_min: dict[int, int] = {}
+        row_x_max: dict[int, int] = {}
+        for y, x in zip(contour_ys, contour_xs):
+            y_i = int(y)
+            if y_i in row_x_min:
+                if x < row_x_min[y_i]:
+                    row_x_min[y_i] = x
+                if x > row_x_max[y_i]:
+                    row_x_max[y_i] = x
+            else:
+                row_x_min[y_i] = x
+                row_x_max[y_i] = x
+        widths = np.zeros(h_img, dtype=np.float32)
+        for y_i, x_lo in row_x_min.items():
+            widths[y_i] = float(row_x_max[y_i] - x_lo)
+
+        # 2. 高斯平滑（消除轮廓抖动）
+        smooth_k = max(5, ch // 30)
+        if smooth_k % 2 == 0:
+            smooth_k += 1
+        widths_s = cv2.GaussianBlur(
+            widths.reshape(-1, 1), (smooth_k, 1), 0
+        ).flatten()
+
+        # 3. 肩部 y：上半 60% 内宽度极大值（first max 通常是结构肩部）
+        upper_end = min(y_max, int(y_min + ch * 0.60))
+        shoulder_band = widths_s[y_min:upper_end + 1]
+        if shoulder_band.size > 0 and shoulder_band.max() > 0:
+            shoulder_y_offset = int(np.argmax(shoulder_band))
+            shoulder_y = shoulder_y_offset + y_min
+        else:
+            shoulder_y = int(y_min + ch * 0.20)
+
+        # 4. 腋下 y：肩部之下到 70% 内的宽度极小值
+        armpit_top = max(y_min, shoulder_y + max(int(ch * 0.03), 5))
+        armpit_bot = min(y_max, int(y_min + ch * 0.70))
+        if armpit_top < armpit_bot and armpit_bot > armpit_top:
+            armpit_band = widths_s[armpit_top:armpit_bot + 1]
+            armpit_y_offset = int(np.argmin(armpit_band))
+            armpit_y = armpit_y_offset + armpit_top
+        else:
+            armpit_y = int(y_min + ch * 0.45)
+
+        # 5. 在 shoulder_y / armpit_y 行取 contour 左右极值
+        def _row_extrema_from_contour(y: int):
+            ys_match = (contour_ys == y)
+            xs_at = contour_xs[ys_match]
+            if len(xs_at) >= 2:
+                return (int(xs_at.min()), int(y)), (int(xs_at.max()), int(y))
+            return None
+
+        sh_ext = _row_extrema_from_contour(shoulder_y)
+        if sh_ext is not None:
+            left_shoulder, right_shoulder = sh_ext
+        else:
+            band_top = max(0, shoulder_y - 20)
+            band_bot = min(h_img - 1, shoulder_y + 20)
+            left_shoulder, right_shoulder = ClothingDetector._left_right_extrema(
+                clean_points, band_top, band_bot,
+            )
+
+        ar_ext = _row_extrema_from_contour(armpit_y)
+        if ar_ext is not None:
+            left_armpit, right_armpit = ar_ext
+        else:
+            band_top = max(0, armpit_y - 20)
+            band_bot = min(h_img - 1, armpit_y + 20)
+            left_armpit, right_armpit = ClothingDetector._left_right_extrema(
+                clean_points, band_top, band_bot,
+            )
+
+        # 6. 领口：上半 30% 内宽度谷值（V1 宽度谷值逻辑，作用于 mask）
+        #    这里 mask 宽度和 contour 宽度在领口处基本一致，用 mask 即可。
+        widths_mask = (mask > 0).sum(axis=1).astype(np.float32)
+        upper_limit = min(y_max, int(y_min + ch * 0.30))
+        if upper_limit > y_min and (upper_limit - y_min) >= 4:
+            wu = widths_mask[y_min:upper_limit + 1].copy()
+            k = np.array([1, 2, 3, 2, 1], dtype=np.float32); k /= k.sum()
+            wu = np.convolve(wu, k, mode="same")
+            neck_row = int(np.argmin(wu)) + y_min
+        else:
+            neck_row = y_min
+        row_xs = np.where(mask[neck_row] > 0)[0]
+        if len(row_xs) >= 2:
+            top_center = (int((row_xs[0] + row_xs[-1]) / 2), neck_row)
+        else:
+            mid_x = int((left_shoulder[0] + right_shoulder[0]) / 2)
+            top_center = (mid_x, neck_row)
+
+        # 7. 底摆：底部 5% 极值 + 内缩（V1 逻辑）
+        bottom_band_top = int(y_max - ch * 0.05)
+        left_bottom_raw, right_bottom_raw = ClothingDetector._left_right_extrema(
+            clean_points, bottom_band_top, y_max,
+        )
+        bw = right_bottom_raw[0] - left_bottom_raw[0]
+        inset = int(bw * 0.08)
+        left_bottom = (left_bottom_raw[0] + inset, y_max)
+        right_bottom = (right_bottom_raw[0] - inset, y_max)
+        bottom_center = ((left_bottom[0] + right_bottom[0]) // 2, y_max)
+
+        # ---- 调试可视化：把宽度剖面画在主图右侧 ----
+        if _DEBUG_DIR != Path("/__virtual_tryon_debug_disabled__"):
+            vis = (image if image.shape[2] == 3
+                   else cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)).copy()
+            panel_w = 200
+            profile_w = widths_s[y_min:y_max + 1]
+            max_w = profile_w.max() if profile_w.max() > 0 else 1
+            prof_img = np.full((y_max - y_min + 1, panel_w, 3), 255, dtype=np.uint8)
+            for y in range(y_min, y_max + 1):
+                w = int(widths_s[y] / max_w * (panel_w - 4))
+                if w > 0:
+                    cv2.line(prof_img, (0, y - y_min), (w, y - y_min), (0, 0, 0), 1)
+            for name, y in [("shoulder", shoulder_y), ("armpit", armpit_y),
+                            ("neck", neck_row)]:
+                cv2.line(prof_img, (0, y - y_min), (panel_w, y - y_min),
+                         (0, 0, 255), 1)
+                cv2.putText(prof_img, name, (panel_w - 60, y - y_min + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            h_v = vis.shape[0]
+            if prof_img.shape[0] < h_v:
+                pad = np.full((h_v - prof_img.shape[0], panel_w, 3),
+                              255, dtype=np.uint8)
+                prof_img = np.vstack([prof_img, pad])
+            elif prof_img.shape[0] > h_v:
+                prof_img = prof_img[:h_v]
+            vis = np.hstack([vis, prof_img])
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_v3_profile.png"), vis)
+
+        def mk(name: str, p: tuple[int, int]) -> Keypoint:
+            return Keypoint(int(p[0]), int(p[1]), name=name)
+
+        return {
+            "top_center":     mk("top_center",     top_center),
+            "bottom_center":  mk("bottom_center",  bottom_center),
+            "left_shoulder":  mk("left_shoulder",  left_shoulder),
+            "right_shoulder": mk("right_shoulder", right_shoulder),
+            "left_armpit":    mk("left_armpit",    left_armpit),
+            "right_armpit":   mk("right_armpit",   right_armpit),
+            "left_bottom":    mk("left_bottom",    left_bottom),
+            "right_bottom":   mk("right_bottom",   right_bottom),
+        }
