@@ -6,7 +6,7 @@ Stage 1 子命令：
     detect-human     - 只检测人体关键点。
 
 Stage 2 子命令：
-    run              - 完整流水线（轮廓采样 → TPS 变形 → 融合）。
+    run              - 完整流水线（轮廓采样 → 流水式 warp → 融合）。
 """
 
 from __future__ import annotations
@@ -33,8 +33,7 @@ from virtual_tryon.human_cache import (
 from virtual_tryon.human_detector import body_region_contour
 from virtual_tryon.clothing_detector import set_debug_dir as set_clothing_debug
 from virtual_tryon.io import ensure_dir, load_image, save_image
-from virtual_tryon.keypoints import CORRESPONDENCE
-from virtual_tryon.tps_warp import blend, warp_clothing
+from virtual_tryon.warp import blend, warp_clothing
 from virtual_tryon.visualize import draw_keypoints
 
 logger = logging.getLogger(__name__)
@@ -155,9 +154,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         clothing_rgb = clothing_img
 
-    # 3. 衣服轮廓采样（同时得到 mask、领口锚点、8 个语义关键点）
+    # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
     clothing_det = ClothingDetector()
-    clothing_pts, clothing_mask, cloth_anchor, cloth_8kpts = (
+    clothing_pts, clothing_mask, cloth_anchor, _ = (
         clothing_det.sample_contour(clothing_img, n_points=args.n_points)
     )
 
@@ -173,28 +172,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     neck_offset = max(0.0, (neck_y - nose_y) * 0.30)
     body_anchor = (neck_x, neck_y - neck_offset)
 
-    # 4. 变形（领口 → 脖子锚定；method=tps 时用 TPS 路径，anchor 被忽略）
+    # 4. 变形（领口 → 脖子锚定）
     logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)
-
-    # 8 对语义对应：按 CORRESPONDENCE 把衣服点 → 人体点。
-    # CORRESPONDENCE 没列 bottom_center，用左右髋中点补齐，使配对数和
-    # 衣服关键点数一致。
-    semantic_pairs: np.ndarray | None = None
-    if args.warp_method == "tps":
-        pairs: list[list[list[float]]] = []
-        for cloth_name, human_name in CORRESPONDENCE.items():
-            ck = cloth_8kpts[cloth_name]
-            hk = human_kpts[human_name]
-            pairs.append([[float(ck.x), float(ck.y)], [float(hk.x), float(hk.y)]])
-        # bottom_center -> (left_hip, right_hip) 中点
-        bc = cloth_8kpts["bottom_center"]
-        lh, rh = human_kpts["left_hip"], human_kpts["right_hip"]
-        pairs.append([
-            [float(bc.x), float(bc.y)],
-            [(lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0],
-        ])
-        semantic_pairs = np.array(pairs, dtype=np.float32)
-        logger.info("TPS 语义对应点数：%d", len(pairs))
 
     warped_rgb, warped_mask = warp_clothing(
         clothing_fg, clothing_mask, clothing_pts, body_pts,
@@ -202,7 +181,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         clothing_anchor=cloth_anchor,
         body_anchor=body_anchor,
         method=args.warp_method,
-        semantic_pairs=semantic_pairs,
     )
 
     # Debug overlay 1: body_pts 叠加在 person 图
@@ -296,7 +274,7 @@ def main() -> int:
     p_cache_h.set_defaults(func=cmd_cache_human)
 
     p_run = sub.add_parser(
-        "run", help="完整虚拟试衣流水线（轮廓采样 → TPS 变形 → 融合）"
+        "run", help="完整虚拟试衣流水线（轮廓采样 → 流水式 warp → 融合）"
     )
     p_run.add_argument("--person", required=True, help="人体图像路径")
     p_run.add_argument("--clothing", required=True, help="服装图像路径")
@@ -308,9 +286,9 @@ def main() -> int:
         help="忽略人体关键点缓存，强制重新跑模型",
     )
     p_run.add_argument(
-        "--warp-method", choices=["affine", "flow", "tps"], default="affine",
-        help="warp 算法：affine=Stage A 仿射（默认）；flow=Stage A+流水式逐行 fit；"
-             "tps=薄板样条非线性形变（已不推荐）",
+        "--warp-method", choices=["flow", "affine"], default="flow",
+        help="warp 算法：flow=Stage A 仿射 + Stage B 流水式逐行 fit"
+             "（默认，推荐）；affine=仅 Stage A 仿射（不 fit）",
     )
     p_run.set_defaults(func=cmd_run)
 

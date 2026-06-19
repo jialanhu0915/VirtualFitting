@@ -70,8 +70,8 @@ CLOTHING_KEYPOINTS: set[str] = {
 
 
 # 服装关键点 -> 人体关键点的对应关系。
-# 该表是试衣流水线的核心配置：它决定了 TPS/仿射变换如何把服装
-# 上的每个语义点对齐到人体的对应部位。
+# 该表是试衣流水线的核心配置：历史上用于 TPS 语义点对应（已废弃），
+# 现在保留供调试和未来可能的残差修正路径使用。
 CORRESPONDENCE: dict[str, str] = {
     "top_center":     "neck",           # 领口中心  -> 脖子（双肩中点）
     "left_shoulder":  "left_shoulder",

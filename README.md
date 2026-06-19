@@ -13,8 +13,8 @@
 
 ✅ **模块化设计**
 - 关键点检测模块
-- TPS变形模块（待实现）
-- 图像融合模块（待实现）
+- 流水式 warp 模块（Stage A 仿射 + Stage B 按 silhouette 逐行 fit + 长袖分块）
+- 图像融合模块
 
 ## 📦 安装依赖
 
@@ -132,12 +132,14 @@ MediaPipe提供33个身体关键点，我们主要使用：
 └─────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
-│   TPS变形（下一步实现）               │
-│   - 将服装变形适配人体姿态            │
+│   流水式 warp                         │
+│   - Stage A 仿射粗定位（领口→脖子）   │
+│   - Stage B 逐行 fit（按 silhouette） │
+│   - 长袖自动分块（躯干/左袖/右袖）    │
 └─────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
-│   图像融合（下一步实现）              │
+│   图像融合                            │
 │   - 颜色调整                         │
 │   - 边缘融合                         │
 │   - 最终合成                         │
@@ -162,7 +164,7 @@ VirtualFitting/
 ├── main.py                       # 入口（交互菜单）
 ├── virtual_tryon_simple.py       # 快速模式：OpenCV 关键点检测
 ├── virtual_tryon_system.py       # 完整模式：MediaPipe 关键点检测
-├── virtual_tryon_complete.py     # 完整流程（含 TPS 变形 + 图像融合）
+├── virtual_tryon_complete.py     # 完整流程（含流水式 warp + 图像融合）
 ├── requirements.txt              # pip 依赖
 ├── pyproject.toml / uv.lock      # uv 项目配置与锁文件
 ├── .python-version               # Python 版本（3.13）
@@ -179,7 +181,7 @@ VirtualFitting/
 |---|---|
 | `human_keypoints.jpg` | 人体关键点可视化 |
 | `clothing_keypoints.jpg` | 服装关键点可视化 |
-| `warped_clothing.jpg` | TPS 变形后的服装（`complete` 版本） |
+| `warped_clothing.png` | 流水式 warp 后的服装（lossless PNG，避免 JPEG 压缩伪影） |
 | `final_tryon_result.jpg` | 最终试衣结果（`complete` 版本） |
 
 ## ⚠️ 注意事项
@@ -264,7 +266,6 @@ A: Dockerfile 已配置阿里云镜像与清华 pip 源。若仍失败，参见 
 ## 📚 参考文献
 
 1. MediaPipe Pose: [https://google.github.io/mediapipe/solutions/pose.html](https://google.github.io/mediapipe/solutions/pose.html)
-2. TPS插值原理: Bookstein, F. L. (1989). "Principal warps: Thin-plate splines and the decomposition of deformations"
 
 ## 🤝 贡献
 
