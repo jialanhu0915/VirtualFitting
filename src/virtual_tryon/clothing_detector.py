@@ -475,8 +475,13 @@ class ClothingDetector:
             return (int(lx[idx]), int(ys[idx])), (int(rx[idx]), int(ys[idx]))
 
         threshold = max(float(np.median(np.abs(dw))) * 3.0, 1.0)
-        # argmax 在全 False 时返回 0，所以用 np.where 拿首个 True idx。
-        jump_idx_arr = np.where(dw > threshold)[0]
+        # 过滤掉宽度 < max_width * 10% 的退化行（contour 异常窄的 y）。
+        # 平滑的衣服轮廓里这些行只有 1-2 个点，会产生虚假 jump。
+        max_w = float(widths.max())
+        row_ok = (widths >= max_w * 0.10).astype(np.float32)
+        # dw[i] 比较 ys[i] 和 ys[i+1]，任一行退化都置 0
+        dw_masked = dw * row_ok[:-1] * row_ok[1:]
+        jump_idx_arr = np.where(dw_masked > threshold)[0]
         if len(jump_idx_arr) == 0:
             # 无袖款：退化为范围内最宽 y
             best_idx = int(np.argmax(widths))

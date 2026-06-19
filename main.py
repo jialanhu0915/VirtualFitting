@@ -39,11 +39,6 @@ from virtual_tryon.visualize import draw_keypoints
 logger = logging.getLogger(__name__)
 
 
-# 进入 TPS 时排除下摆 → 髋的强对应：衣服下摆通常远低于髋（旗袍到脚踝），
-# 强对应会把下半身压缩到髋高度。剔除后下摆按 TPS 的远距离仿射行为自然下垂。
-_TPS_EXCLUDED_CORRESPONDENCE: set[str] = {"left_bottom", "right_bottom"}
-
-
 def _dump_keypoints(label: str, kpts: dict[str, Keypoint]) -> None:
     """以表格形式打印关键点坐标和置信度。"""
     logger.info("%s 关键点（共 %d 个）：", label, len(kpts))
@@ -235,14 +230,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)
 
     # TPS 控制点构造：
-    # - 排除 *_bottom（下摆 → 髋强对应会把长款衣服压到髋高度）
+    # - 直接按 CORRESPONDENCE 遍历（6 对：领、左右肩、左右腋下、左右胯），
+    #   CORRESPONDENCE 自身已剔除 bottom 三对（keypoints.py 改动后）。
     # - top_center → neck 作为中线锚点，**不外推**（领中点和 neck 都在中线）
-    # - 其余 4 对（左右肩、左右腋下）的 dst 用 _cover_outpush 做覆盖性外推，
-    #   消除"关节中心 vs 轮廓边缘"的几何错配（详见函数 docstring）
+    # - 其余 5 对的 dst 用 _cover_outpush 做覆盖性外推，消除"关节中心
+    #   vs 轮廓边缘"的几何错配（详见函数 docstring）
     semantic_pairs: np.ndarray | None = None
     if args.warp_method == "tps":
-        # affine 参考变换：领口 → neck 为锚点，scale 取衣服 5 个上半身语义点
-        # 和对应人体点外接矩形的 max(W/w, H/h)，保证衣服 cover 上半身。
+        # affine 参考变换：领口 → neck 为锚点，scale 取衣服和人体轮廓 bbox
+        # 的 max(W/w, H/h) * 1.05（与 affine 路径同款）。
         cloth_anchor_pt = np.array(
             [cloth_8kpts["top_center"].x, cloth_8kpts["top_center"].y],
             dtype=np.float32,
@@ -255,12 +251,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             (human_kpts["left_hip"].y + human_kpts["right_hip"].y) / 2.0,
         ], dtype=np.float32)
 
-        # scale：复用 affine 路径同款公式（轮廓 bbox 的 max(W/w, H/h)），
-        # 而不是用 5 个稀疏语义点。语义点里 armpit↔elbow 不是"几何锚定"
-        # 而是"穿上后大致到肘"的近似，纳入 bbox 会把 scale 拉偏（实测
-        # 旗袍上算出 scale<1 导致外推全 no-op）。轮廓 bbox 反映整件衣服
-        # vs 整个躯干区域的尺寸比，和 affine 路径里的 scale 含义一致，
-        # 在"实测能 cover"这点上已被验证。
         cw = max(float(np.ptp(clothing_pts[:, 0])), 1.0)
         ch = max(float(np.ptp(clothing_pts[:, 1])), 1.0)
         bw = max(float(np.ptp(body_pts[:, 0])), 1.0)
@@ -269,8 +259,6 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         pairs: list[list[list[float]]] = []
         for cloth_name, human_name in CORRESPONDENCE.items():
-            if cloth_name in _TPS_EXCLUDED_CORRESPONDENCE:
-                continue
             ck = cloth_8kpts[cloth_name]
             hk = human_kpts[human_name]
             cloth_pt = np.array([ck.x, ck.y], dtype=np.float32)
