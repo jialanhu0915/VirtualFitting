@@ -229,22 +229,108 @@ def _body_silhouette_per_row(
     return body_left, body_right
 
 
-def _cloth_silhouette_per_row(
-    cloth_mask: np.ndarray, ys: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """对每个 y 求衣服 mask 左右边（每行扫描）。
+def _build_body_regions(
+    body_pts: np.ndarray, out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """基于 body_pts 顶点构造 3 个区域 mask（躯干/左袖/右袖）。
 
-    返回 -1 表示该 y 没有衣服像素。
+    body_pts 顶点顺序（10 点 arm-aware）：
+        0 neck_top, 1 lsh, 2 larmpit, 3 lelbow, 4 lwrist,
+        5 bottom_center, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
+
+    区域：
+      躯干: neck_top → lsh(顶点1) → lhip line 到底中 → rhip line 到 rsh(顶点9)
+      左袖: 顶点 1-4 之间的"袖子带"（肩外 → 腋 → 腕内侧 → 腕外）
+      右袖: 镜像
+
+    Returns:
+        (mask_torso, mask_lsleeve, mask_rsleeve) — 三个 (H, W) bool 数组。
+        同一像素可能被多个 mask 覆盖（袖子/躯干交接处）；用 np.logical_or
+        累加，最终优先级：lsleeve > rsleeve > torso。
+    """
+    H, W = out_shape
+    # body_pts 是采样后的（n_points 个），不是 10 个原顶点——不能直接用
+    # "第 1 个 = lsh"这种假设。改用极值法：
+
+    pts = body_pts
+    x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
+    y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
+
+    # 区域 1（躯干）：用 x 的"中间 60%" 作为躯干，y 范围 = 整个 body
+    # （手臂外缘 x 偏离躯干 > 30px 才算袖子，所以袖子 = 身体外侧 20%）
+    torso_x_lo = x_min + 0.20 * (x_max - x_min)
+    torso_x_hi = x_min + 0.80 * (x_max - x_min)
+    yy, xx = np.mgrid[0:H, 0:W]
+    mask_torso = (xx >= torso_x_lo) & (xx <= torso_x_hi) \
+        & (yy >= y_min) & (yy <= y_max)
+
+    # 区域 2/3（袖子）：取身体 x 外侧 22% 范围。y 范围 = 腋下到腕。
+    # 用 body_pts y 分布的 25% 和 95% 分位近似"腋下"和"腕"。
+    ys_sorted = np.sort(pts[:, 1])
+    armpit_y = float(ys_sorted[int(len(ys_sorted) * 0.30)])
+    wrist_y = float(ys_sorted[int(len(ys_sorted) * 0.95)])
+
+    # 左袖：图像坐标右侧（x 大），x >= torso_x_hi
+    mask_lsleeve = (xx >= torso_x_hi) \
+        & (yy >= armpit_y) & (yy <= wrist_y)
+    # 右袖：图像坐标左侧（x 小），x <= torso_x_lo
+    mask_rsleeve = (xx <= torso_x_lo) \
+        & (yy >= armpit_y) & (yy <= wrist_y)
+
+    return mask_torso, mask_lsleeve, mask_rsleeve
+
+
+def _region_silhouette_per_row(
+    body_pts: np.ndarray,
+    cloth_mask: np.ndarray,
+    region_mask: np.ndarray,
+    ys: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """对每个 y，在 region_mask 内的 body 边界 + cloth 像素上取 silhouette。
+
+    body_silhouette：先算 body_pts 全行 silhouette，再 mask 掉 region 外的 x。
+    cloth_silhouette：在 region_mask 内扫 cloth 像素的左右边界。
+
+    Args:
+        body_pts: 身体轮廓 (N, 2)
+        cloth_mask: 衣服 mask (H, W)
+        region_mask: 区域 bool mask (H, W)
+        ys: 采样 y 数组
+
+    Returns:
+        (body_left, body_right, cloth_left, cloth_right) — 长度 len(ys)。
+        无效位置 NaN 或 -1。
     """
     h, w = cloth_mask.shape
+
+    # body silhouette：先全行，再 mask
+    body_left_full, body_right_full = _body_silhouette_per_row(body_pts, ys)
+
+    # 在每个 y 的 body 范围内，限制到 region_mask 的 x 范围
     yi = np.clip(np.round(ys).astype(int), 0, h - 1)
-    rows = cloth_mask[yi] > 0                       # (n, W) bool
-    has_cloth = rows.any(axis=1)
-    left_idx = np.argmax(rows, axis=1).astype(float)
-    right_idx = (w - 1 - np.argmax(rows[:, ::-1], axis=1)).astype(float)
-    cloth_left = np.where(has_cloth, left_idx, -1.0)
-    cloth_right = np.where(has_cloth, right_idx, -1.0)
-    return cloth_left, cloth_right
+    body_left = np.full(len(ys), np.nan, dtype=np.float64)
+    body_right = np.full(len(ys), np.nan, dtype=np.float64)
+    for i, y in enumerate(yi):
+        if not np.isfinite(body_left_full[i]) or not np.isfinite(body_right_full[i]):
+            continue
+        bl, br = int(body_left_full[i]), int(body_right_full[i])
+        region_xs = np.where(region_mask[y, bl:br + 1])[0]
+        if len(region_xs) == 0:
+            continue
+        body_left[i] = bl + region_xs[0]
+        body_right[i] = bl + region_xs[-1]
+
+    # cloth silhouette：在 region_mask 内扫描
+    cloth_left = np.full(len(ys), -1.0, dtype=np.float64)
+    cloth_right = np.full(len(ys), -1.0, dtype=np.float64)
+    for i, y in enumerate(yi):
+        row_cloth = (cloth_mask[y] > 0) & region_mask[y]
+        if not row_cloth.any():
+            continue
+        cloth_left[i] = float(np.argmax(row_cloth))
+        cloth_right[i] = float(w - 1 - np.argmax(row_cloth[::-1]))
+
+    return body_left, body_right, cloth_left, cloth_right
 
 
 def _warp_affine_stage_a(
@@ -333,20 +419,27 @@ def _warp_flow(
     body_pts: np.ndarray,
     out_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Stage B: 流水式逐行 stretch。
+    """Stage B: 流水式逐行 stretch（分块 fit）。
 
     Stage A 已经把衣服粗定位到身体区域（领口对齐 + bbox 缩放）。
-    本函数按"流水"语义逐行把衣服 fit 到身体轮廓：
+    本函数按"流水"语义逐行把衣服 fit 到身体轮廓。**Step 3**：
+    把人体分成 3 个独立区域（躯干/左袖/右袖），各区域分别算 (s, t)，
+    避免 arm-aware silhouette 把衣服主体横向撑宽 + 袖子糊在躯干两侧。
 
-      - 对每个采样 y，求 body 轮廓左右边 (bL, bR) 和 cloth 轮廓左右边 (cL, cR)
-      - 算 s(y) = (bR - bL) / (cR - cL),  t(y) = bL - s * cL
-      - 在最上方衣服像素行锚定 s=1, t=0（领口不位移）
-      - 用 cubic spline 平滑 s(y), t(y)
-      - 对整张图做 cv2.remap：x_new = s(y)·x + t(y)
+    每个 y 对每个区域独立算：
+      s(y, region) = body_w_region / cloth_w_region
+      t(y, region) = body_left_region - s * cloth_left_region
 
-    与 v3 TPS 控制点路径的关键差异：本方法用 **每行两个连续点**（密集、连续、
-    落在 silhouette 上）做 fit，目标是把布边 fit 到身轮廓——"按轮廓贴合"，
-    不是按稀疏语义点拉扯。袖子自然被压回躯干宽度（短袖 OK，长袖需 Step 2）。
+    remap 时按 region_id 选 s, t。
+
+    短袖场景：袖子区域在 y > shoulder 无 cloth 像素 → valid=False →
+    s=1, t=0 → 袖子消失，等价旧行为。
+
+    Args:
+        stage_a_rgb: Stage A 仿射后的衣服 RGB
+        stage_a_mask: Stage A 仿射后的衣服 mask
+        body_pts: arm-aware 身体轮廓
+        out_shape: 输出 (H, W)
     """
     H_out, W_out = out_shape
 
@@ -363,113 +456,164 @@ def _warp_flow(
     n_samples = 30
     ys_query = np.linspace(top_y, max(body_bottom, top_y + 1), n_samples)
 
-    body_left, body_right = _body_silhouette_per_row(body_pts, ys_query)
-    cloth_left, cloth_right = _cloth_silhouette_per_row(stage_a_mask, ys_query)
-
-    # 算 s(y), t(y)。cloth 没像素 或 body 单点（width=0）的行无效。
-    s = np.ones(n_samples, dtype=np.float64)
-    t = np.zeros(n_samples, dtype=np.float64)
-    valid = (
-        np.isfinite(body_left) & np.isfinite(body_right)
-        & (cloth_left >= 0) & (cloth_right > cloth_left)
-        & (body_right > body_left)
+    # 3 个区域 mask (H, W) bool
+    mask_torso, mask_lsleeve, mask_rsleeve = _build_body_regions(
+        body_pts, (H_out, W_out),
     )
-    body_w = body_right - body_left
-    cloth_w = cloth_right - cloth_left
-    s[valid] = body_w[valid] / cloth_w[valid]
-    # 先 clamp s 再算 t：否则 raw s=4.07（V 领/衣架处）配合 cloth_left≈353 会让
-    # t=-1205，即使 s 之后 clamp 到 1.5，t 仍然停在 -1205，把 cloth 推到 output x=0。
-    s[valid] = np.clip(s[valid], 0.7, 1.5)
-    t[valid] = body_left[valid] - s[valid] * cloth_left[valid]
 
-    # 锚定 top_y：s=1, t=0（最上方衣服像素不位移，保留 Stage A 定位）
-    top_idx = 0                                # ys_query[0] == top_y
-    s[top_idx] = 1.0
-    t[top_idx] = 0.0
+    # 为 region_id 提供优先级：lsleeve > rsleeve > torso
+    # 不在任一 region 内：region_id = -1
+    region_id = np.full((H_out, W_out), -1, dtype=np.int8)
+    region_id[mask_torso] = 0
+    region_id[mask_rsleeve] = 2   # 先覆盖右袖（图像左侧）
+    region_id[mask_lsleeve] = 1   # 再覆盖左袖（图像右侧，优先级最高）
 
-    # V 领保留区 + 平滑过渡：
-    # V 领开口很窄（cloth_w ≈ 17-69 px），身体同位置宽 45-187 px，
-    # 流水式 fit 规则会把 V 领 cloth 强行拉伸成一条横向 ribbon（s ≈ 1.5 + t 巨大
-    # 负值）。保留 V 领形状才是真实穿着的样子（V 领不拉伸，只在 chest 才开始 fit）。
-    #
-    # 实现细节：
-    # - 前 K-1 个 sample：100% V 领保留（s=1, t=0）
-    # - 第 K 个 sample（过渡）：50% V 领 + 50% 正常 fit（避免 s, t 在边界突变）
-    # - K+1 及以后：完全正常 fit
-    #
-    # 平滑过渡必要性：如果 V 领边界（K）突然从 (1, 0) 变到正常 fit 的 (1.5, -260)，
-    # 在边界处 cloth 位置会跳变（image3 衬衫因衣架污染导致 cloth_w 在边界处剧烈
-    # 变化，1 px 跳到 31 px，s 跳变放大成 cloth 位置跳到 x=0）。50/50 混合让
-    # 边界处的 s, t 渐变，消除跳变。
+    # 对每个 region 独立算 silhouette 和 (s, t)
+    # region_data: list of dict {name, mask, s, t}
+    region_masks = [
+        ("torso", mask_torso),
+        ("lsleeve", mask_lsleeve),
+        ("rsleeve", mask_rsleeve),
+    ]
+    region_s: dict[str, np.ndarray] = {}
+    region_t: dict[str, np.ndarray] = {}
+    region_valid: dict[str, np.ndarray] = {}
+
+    for name, rmask in region_masks:
+        bl, br, cl, cr = _region_silhouette_per_row(
+            body_pts, stage_a_mask, rmask, ys_query,
+        )
+        s_r = np.ones(n_samples, dtype=np.float64)
+        t_r = np.zeros(n_samples, dtype=np.float64)
+        valid_r = (
+            np.isfinite(bl) & np.isfinite(br)
+            & (cl >= 0) & (cr > cl)
+            & (br > bl)
+        )
+        bw = br - bl
+        cw = cr - cl
+        s_r[valid_r] = bw[valid_r] / cw[valid_r]
+        # clamp-before-t（与 558cd0a 一致）
+        s_r[valid_r] = np.clip(s_r[valid_r], 0.7, 1.5)
+        t_r[valid_r] = bl[valid_r] - s_r[valid_r] * cl[valid_r]
+        region_s[name] = s_r
+        region_t[name] = t_r
+        region_valid[name] = valid_r
+
+    # V 领保留：s=1, t=0（仅 torso；袖子无 V 领概念）
     V_NECK_SAMPLES = 3
-    # 50/50 平滑过渡：前 K-1 个 sample 100% V 领保留，第 K 个 50% V 领 + 50% 正常 fit
-    # s, t 在边界处不跳变（避免 cloth 位置跳到画外）。s 已经在前面 clamp 过了。
-    if V_NECK_SAMPLES < n_samples and bool(valid[V_NECK_SAMPLES]):
-        s_trans_raw = float(s[V_NECK_SAMPLES])
-        t_trans_raw = float(t[V_NECK_SAMPLES])
-    else:
-        s_trans_raw = 1.0
-        t_trans_raw = 0.0
-    for i in range(1, V_NECK_SAMPLES):
-        s[i] = 1.0
-        t[i] = 0.0
-    if V_NECK_SAMPLES < n_samples:
-        s[V_NECK_SAMPLES] = 0.5 + 0.5 * s_trans_raw
-        t[V_NECK_SAMPLES] = 0.5 * t_trans_raw
+    for name in ("torso", "lsleeve", "rsleeve"):
+        s_r = region_s[name]
+        t_r = region_t[name]
+        valid_r = region_valid[name]
+        # 锚定 top_y
+        s_r[0] = 1.0
+        t_r[0] = 0.0
+        # V 领保留仅作用于躯干（袖子无需保留）
+        if name != "torso":
+            region_valid[name] = valid_r | (np.arange(n_samples) == 0)
+            continue
+        # 50/50 平滑过渡（同 _warp_flow 旧逻辑）
+        if V_NECK_SAMPLES < n_samples and bool(valid_r[V_NECK_SAMPLES]):
+            s_trans_raw = float(s_r[V_NECK_SAMPLES])
+            t_trans_raw = float(t_r[V_NECK_SAMPLES])
+        else:
+            s_trans_raw = 1.0
+            t_trans_raw = 0.0
+        for i in range(1, V_NECK_SAMPLES):
+            s_r[i] = 1.0
+            t_r[i] = 0.0
+        if V_NECK_SAMPLES < n_samples:
+            s_r[V_NECK_SAMPLES] = 0.5 + 0.5 * s_trans_raw
+            t_r[V_NECK_SAMPLES] = 0.5 * t_trans_raw
+        region_valid[name] = valid_r | (np.arange(n_samples) == 0)
 
-    used = valid | (np.arange(n_samples) == top_idx)
+    # 限制 s 范围到 [0.7, 1.5]
+    for name in region_s:
+        region_s[name] = np.clip(region_s[name], 0.7, 1.5)
 
-    ys_used = ys_query[used]
-    s_used = s[used]
-    t_used = t[used]
-
-    ys_all = np.arange(H_out, dtype=np.float64)
-
-    # body_pts 的 y 范围外不 warp（s=1, t=0）。原因：spline 在端点外会
-    # 外推出不稳定值（已观察到 qipao 下半身被画出"spline 尾巴"）。
+    # 把 s(y), t(y) 在 y 方向 linear interp 到 H_out
     body_top = float(body_pts[:, 1].min())
     body_bot = float(body_pts[:, 1].max())
+    ys_all = np.arange(H_out, dtype=np.float64)
     in_body = (ys_all >= body_top) & (ys_all <= body_bot)
 
-    s_full = np.ones(H_out, dtype=np.float64)
-    t_full = np.zeros(H_out, dtype=np.float64)
+    s_per_region: dict[str, np.ndarray] = {}
+    t_per_region: dict[str, np.ndarray] = {}
+    for name, _ in region_masks:
+        s_r = region_s[name]
+        t_r = region_t[name]
+        valid_r = region_valid[name]
+        ys_used = ys_query[valid_r]
+        s_used = s_r[valid_r]
+        t_used = t_r[valid_r]
+        s_full = np.ones(H_out, dtype=np.float64)
+        t_full = np.zeros(H_out, dtype=np.float64)
+        if len(ys_used) > 1:
+            s_in = np.interp(ys_all[in_body], ys_used, s_used)
+            t_in = np.interp(ys_all[in_body], ys_used, t_used)
+            s_full[in_body] = np.clip(s_in, 0.7, 1.5)
+            t_full[in_body] = t_in
+        s_per_region[name] = s_full
+        t_per_region[name] = t_full
 
-    # 用 linear interp 而非 cubic spline：cubic spline 在端点附近因
-    # 边界条件会产生振荡（实测：qipao 顶部出现"spline 尾巴"把领口横向
-    # 拉到画外）。linear interp 不振荡，最多"折线感"；30 采样点足够密。
-    s_in = np.interp(ys_all[in_body], ys_used, s_used)
-    t_in = np.interp(ys_all[in_body], ys_used, t_used)
-
-    # 限制 s 范围，避免极端拉扯（V 领/细腰 → body 肩宽 ≈ 2.7x 会把花纹
-    # 拉变形；clamp 到 [0.7, 1.5] 让拉伸有界）。
-    s_in = np.clip(s_in, 0.7, 1.5)
-    s_full[in_body] = s_in
-    t_full[in_body] = t_in
-
-    # 构造 map_x: x_src = (x_out - t(y)) / s(y)
+    # 构造 per-region map_x, map_y：每个 region 一张
+    # 选最大：W_in 是 stage_a_rgb 的宽度
     W_in = stage_a_rgb.shape[1]
     grid_y, grid_x = np.mgrid[0:H_out, 0:W_out]
-    s_full_2d = s_full[:, np.newaxis]
-    t_full_2d = t_full[:, np.newaxis]
-    safe_s = np.where(np.abs(s_full_2d) > 1e-6, s_full_2d, 1.0)
-    valid_s = (np.abs(s_full_2d) > 1e-6) & np.isfinite(s_full_2d)
+
+    # 合并：map_x[y, x] = (x - t[region_id[y, x]](y)) / s[region_id[y, x]](y)
+    # 用 lookup 形式
+    s_map = np.ones((H_out, W_out), dtype=np.float32)
+    t_map = np.zeros((H_out, W_out), dtype=np.float32)
+    s_map[region_id == 0] = s_per_region["torso"][region_id == 0][:, np.newaxis] \
+        if False else np.broadcast_to(
+            s_per_region["torso"][:, np.newaxis], (H_out, W_out)
+        )[region_id == 0]
+    t_map[region_id == 0] = np.broadcast_to(
+        t_per_region["torso"][:, np.newaxis], (H_out, W_out)
+    )[region_id == 0]
+    s_map[region_id == 1] = np.broadcast_to(
+        s_per_region["lsleeve"][:, np.newaxis], (H_out, W_out)
+    )[region_id == 1]
+    t_map[region_id == 1] = np.broadcast_to(
+        t_per_region["lsleeve"][:, np.newaxis], (H_out, W_out)
+    )[region_id == 1]
+    s_map[region_id == 2] = np.broadcast_to(
+        s_per_region["rsleeve"][:, np.newaxis], (H_out, W_out)
+    )[region_id == 2]
+    t_map[region_id == 2] = np.broadcast_to(
+        t_per_region["rsleeve"][:, np.newaxis], (H_out, W_out)
+    )[region_id == 2]
+
+    # 默认（region_id == -1）: s=1, t=0（不变）
+    s_map[region_id == -1] = 1.0
+    t_map[region_id == -1] = 0.0
+
+    safe_s = np.where(np.abs(s_map) > 1e-6, s_map, 1.0)
+    valid_s = (np.abs(s_map) > 1e-6) & np.isfinite(s_map)
     map_x = np.where(
         valid_s,
-        (grid_x - t_full_2d) / safe_s,
+        (grid_x - t_map) / safe_s,
         grid_x.astype(np.float32),
     ).astype(np.float32)
     map_x = np.clip(map_x, 0, W_in - 1).astype(np.float32)
     map_y = grid_y.astype(np.float32)
 
-    if used.sum() > 1:
-        s_min, s_max = float(s[used].min()), float(s[used].max())
-    else:
-        s_min = s_max = 1.0
+    # 调试日志：每个 region 的 s 范围
+    log_lines = []
+    for name, _ in region_masks:
+        v = region_valid[name]
+        if v.sum() > 1:
+            log_lines.append(
+                f"{name}=[{float(region_s[name][v].min()):.2f},{float(region_s[name][v].max()):.2f}]"
+            )
     logger.info(
-        "Stage B flow: top_y=%.0f body_bottom=%.0f samples=%d valid=%d "
-        "s_range=[%.3f, %.3f]",
-        top_y, body_bottom, n_samples, int(used.sum()), s_min, s_max,
+        "Stage B flow (region): top_y=%.0f body_bottom=%.0f valid=",
+        top_y, body_bottom,
     )
+    for line in log_lines:
+        logger.info("  %s", line)
 
     warped_rgb = cv2.remap(
         stage_a_rgb, map_x, map_y,
