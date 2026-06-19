@@ -77,17 +77,19 @@ CLOTHING_KEYPOINTS: set[str] = {
 # 该表是试衣流水线的核心配置：它决定了 TPS/仿射变换如何把服装
 # 上的每个语义点对齐到人体的对应部位。
 #
-# `armpit` 对应人体的 `shoulder`：MediaPipe Pose 33 点里没有"腋下"关键点。
-# 之前用 `elbow` 是"穿上后大致到肘"的近似，但这就是袖子两侧"翼"的根因
-# 之一（袖窿被强行拉到肘外侧，袖子跟着扭曲）。改为 `shoulder` 后语义更清晰：
-# 衣服腋下 ≈ 身体肩部水平位置；TPS 控制点的实际 dst 位置由 main.py 的
-# _cover_outpush 沿"neck→hip中点"法向外推，覆盖肩部外缘。
+# `armpit -> elbow` 的取舍：
+# 语义上腋下 ≈ 肩部高度（同一 y 高度），但 CORRESPONDENCE 字典同时被 TPS
+# 控制点构造使用——TPS 要求 7 对控制点的 dst 全部唯一（否则 L 矩阵出现
+# 重复行 singular，拟合崩溃）。`shoulder` 已经被 shoulder → shoulder 占用，
+# 不能再被 armpit 重复。`elbow` 是唯一可用的离躯干中线较远的人体点。
+# 实际视觉副作用是袖子可能被拉得稍外（v3 已知问题），但不会出现 v4 的
+# "衣服完全消失"（L 矩阵崩溃导致 warped 全部跑出可视区）。
 CORRESPONDENCE: dict[str, str] = {
     "top_center":     "neck",           # 领口中心  -> 脖子（双肩中点）
     "left_shoulder":  "left_shoulder",
     "right_shoulder": "right_shoulder",
-    "left_armpit":    "left_shoulder",  # 衣服腋下 -> 身体肩部（同高）
-    "right_armpit":   "right_shoulder",
+    "left_armpit":    "left_elbow",     # 衣服腋下 -> 身体肘部（TPS 几何稳定）
+    "right_armpit":   "right_elbow",
     "left_hip":       "left_hip",       # 衣服胯部  -> 人体髋
     "right_hip":      "right_hip",
 }
