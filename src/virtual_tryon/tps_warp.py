@@ -377,6 +377,9 @@ def _warp_flow(
     body_w = body_right - body_left
     cloth_w = cloth_right - cloth_left
     s[valid] = body_w[valid] / cloth_w[valid]
+    # 先 clamp s 再算 t：否则 raw s=4.07（V 领/衣架处）配合 cloth_left≈353 会让
+    # t=-1205，即使 s 之后 clamp 到 1.5，t 仍然停在 -1205，把 cloth 推到 output x=0。
+    s[valid] = np.clip(s[valid], 0.7, 1.5)
     t[valid] = body_left[valid] - s[valid] * cloth_left[valid]
 
     # 锚定 top_y：s=1, t=0（最上方衣服像素不位移，保留 Stage A 定位）
@@ -384,14 +387,35 @@ def _warp_flow(
     s[top_idx] = 1.0
     t[top_idx] = 0.0
 
-    # V 领保留区：anchor 下方前 K 个 sample 强制 s=1, t=0，不参与 per-row fit。
-    # 原因：V 领开口很窄（cloth_w ≈ 17-69 px），身体同位置宽 45-187 px，
+    # V 领保留区 + 平滑过渡：
+    # V 领开口很窄（cloth_w ≈ 17-69 px），身体同位置宽 45-187 px，
     # 流水式 fit 规则会把 V 领 cloth 强行拉伸成一条横向 ribbon（s ≈ 1.5 + t 巨大
     # 负值）。保留 V 领形状才是真实穿着的样子（V 领不拉伸，只在 chest 才开始 fit）。
+    #
+    # 实现细节：
+    # - 前 K-1 个 sample：100% V 领保留（s=1, t=0）
+    # - 第 K 个 sample（过渡）：50% V 领 + 50% 正常 fit（避免 s, t 在边界突变）
+    # - K+1 及以后：完全正常 fit
+    #
+    # 平滑过渡必要性：如果 V 领边界（K）突然从 (1, 0) 变到正常 fit 的 (1.5, -260)，
+    # 在边界处 cloth 位置会跳变（image3 衬衫因衣架污染导致 cloth_w 在边界处剧烈
+    # 变化，1 px 跳到 31 px，s 跳变放大成 cloth 位置跳到 x=0）。50/50 混合让
+    # 边界处的 s, t 渐变，消除跳变。
     V_NECK_SAMPLES = 3
-    for i in range(1, min(V_NECK_SAMPLES + 1, n_samples)):
+    # 50/50 平滑过渡：前 K-1 个 sample 100% V 领保留，第 K 个 50% V 领 + 50% 正常 fit
+    # s, t 在边界处不跳变（避免 cloth 位置跳到画外）。s 已经在前面 clamp 过了。
+    if V_NECK_SAMPLES < n_samples and bool(valid[V_NECK_SAMPLES]):
+        s_trans_raw = float(s[V_NECK_SAMPLES])
+        t_trans_raw = float(t[V_NECK_SAMPLES])
+    else:
+        s_trans_raw = 1.0
+        t_trans_raw = 0.0
+    for i in range(1, V_NECK_SAMPLES):
         s[i] = 1.0
         t[i] = 0.0
+    if V_NECK_SAMPLES < n_samples:
+        s[V_NECK_SAMPLES] = 0.5 + 0.5 * s_trans_raw
+        t[V_NECK_SAMPLES] = 0.5 * t_trans_raw
 
     used = valid | (np.arange(n_samples) == top_idx)
 
