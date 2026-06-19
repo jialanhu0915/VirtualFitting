@@ -100,6 +100,26 @@ def _build_body_regions(
     mask_rsleeve = (xx <= torso_x_lo) \
         & (yy >= armpit_y) & (yy <= wrist_y)
 
+    # 切除"超出 body silhouette"的部分：身体最大宽度之外的区域不应属于袖子，
+    # 否则 silhouette 算到图像边缘（_body_silhouette_per_row 只在 body_pts
+    # 范围内返回有限值，body_pts 外的 mask 永远不会贡献 silhouette，但 mask
+    # 本身会被传给 _region_silhouette_per_row 参与 cloth 范围扫描 → 误把
+    # 远处 cloth 像素算进来）。逐 y 把袖子外缘夹到 body_pts silhouette。
+    ys_int = np.arange(int(armpit_y), int(wrist_y) + 1, dtype=np.float64)
+    bl, br = _body_silhouette_per_row(pts, ys_int)
+    for i, y in enumerate(ys_int):
+        yi = int(y)
+        if not (np.isfinite(bl[i]) and np.isfinite(br[i])):
+            continue
+        if bl[i] > torso_x_hi:
+            continue
+        if br[i] < torso_x_lo:
+            continue
+        # 左袖（图像右侧）：x 范围 [torso_x_hi, br[i]]
+        mask_lsleeve[yi] &= (xx[yi] <= int(br[i]))
+        # 右袖（图像左侧）：x 范围 [bl[i], torso_x_lo]
+        mask_rsleeve[yi] &= (xx[yi] >= int(bl[i]))
+
     return mask_torso, mask_lsleeve, mask_rsleeve
 
 
