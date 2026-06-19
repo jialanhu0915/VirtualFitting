@@ -312,8 +312,10 @@ class ClothingDetector:
                    (band_top, band_bottom), (0, 0, 255))
 
         # 2. 肩部
+        # 旧带 12%~22%ch 对长袖款过宽：袖子在 18%ch 之后才明显伸出，
+        # 22%ch 内的最外点实际是袖子外缘而非肩部。收窄到 12%~18%ch。
         shoulder_band_top = int(neck_center[1] + ch * 0.12)
-        shoulder_band_bottom = int(neck_center[1] + ch * 0.22)
+        shoulder_band_bottom = int(neck_center[1] + ch * 0.18)
         left_shoulder, right_shoulder = ClothingDetector._left_right_extrema(
             pts_sorted, shoulder_band_top, shoulder_band_bottom
         )
