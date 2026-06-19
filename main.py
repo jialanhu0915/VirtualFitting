@@ -154,9 +154,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         clothing_rgb = clothing_img
 
-    # 3. 衣服轮廓采样（同时得到 mask 和领口锚点）
+    # 3. 衣服轮廓采样（同时得到 mask 和肩点）
     clothing_det = ClothingDetector()
-    clothing_pts, clothing_mask, cloth_anchor, _ = (
+    clothing_pts, clothing_mask, _, cloth_keypoints = (
         clothing_det.sample_contour(clothing_img, n_points=args.n_points)
     )
 
@@ -164,13 +164,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     mask_3ch = clothing_mask[:, :, np.newaxis] / 255.0
     clothing_fg = (clothing_rgb.astype(np.float32) * mask_3ch).astype(np.uint8)
 
-    # 人体脖子锚点：MediaPipe neck=双肩中点（肩线高度），
-    # 衣服领口应略高于肩线。用人脸 nose 到 neck 距离的 30% 作向上偏移。
-    nose_y = float(human_kpts["nose"].y)
-    neck_x = float(human_kpts["neck"].x)
-    neck_y = float(human_kpts["neck"].y)
-    neck_offset = max(0.0, (neck_y - nose_y) * 0.30)
-    body_anchor = (neck_x, neck_y - neck_offset)
+    # 对齐基准：肩线中点（不靠衣领，衣领 anchor 会被衣架/打褶污染）。
+    # 服装端用 ClothingDetector 派生的 left/right_shoulder Keypoint；
+    # 人体端用 MediaPipe 的 left/right_shoulder。两者都是 (x, y) 像素坐标。
+    cls_x = float(cloth_keypoints["left_shoulder"].x)
+    crs_x = float(cloth_keypoints["right_shoulder"].x)
+    cls_y = float(cloth_keypoints["left_shoulder"].y)
+    crs_y = float(cloth_keypoints["right_shoulder"].y)
+    cloth_anchor = ((cls_x + crs_x) / 2, (cls_y + crs_y) / 2)
+
+    bls_x = float(human_kpts["left_shoulder"].x)
+    brs_x = float(human_kpts["right_shoulder"].x)
+    bls_y = float(human_kpts["left_shoulder"].y)
+    brs_y = float(human_kpts["right_shoulder"].y)
+    body_anchor = ((bls_x + brs_x) / 2, (bls_y + brs_y) / 2)
 
     # 4. 变形（领口 → 脖子锚定）
     logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)

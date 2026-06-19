@@ -165,24 +165,33 @@ def _warp_affine_stage_a(
     body_anchor: tuple[float, float] | None,
     out_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Stage A: 仿射粗定位（按身体外接矩形 + 领口锚点对齐）。
+    """Stage A: 仿射粗定位（按"肩线"做对齐基准）。
 
-    旧"用 8 对语义关键点做 TPS warp"路径是错误的根本方向——TPS
-    按点插值不按轮廓贴合，衣服被按点拉扯成"翼"/"舌头"。Stage A
-    用简单的外接矩形 + 锚点对齐做"按整体轮廓贴合"：
+    用户原话："让两个 mask 的上方的边缘尽可能贴合，以长度更长的肩部
+    的线作为对齐"——不用衣领 anchor。Stage A 接收 clothing_anchor
+    和 body_anchor 作为"肩线中点"：(cx, cy) = 服装 / 人体肩线中心，
+    scale 由 bbox 兜底（保证衣服覆盖身体）。
 
-      scale = max(body_w / cloth_w, body_h / cloth_h) * 1.05
-      tx, ty 让 cloth 领口（clothing_anchor）映射到 body 脖子（body_anchor）
+    旧版用衣领 anchor 失败的原因：
+    - clothing 端 anchor 是 mask 顶中点 → image3 衣架钩子、image1
+      立领打褶处都污染
+    - body 端 anchor 用 neck - 30% 偏移 → 跟 clothing 端没耦合
 
-    这保证衣服覆盖身体区域（max 保证两个方向都不小于 1.0，加 1.05
-    余量），且领口对齐人体脖子（保证纵向位置正确）。
+    新版：
+    - clothing_anchor = 服装肩线中点（由 main.py 从 clothing
+      Keypoints 算：left_shoulder + right_shoulder 的中点）
+    - body_anchor = 人体肩线中点（MediaPipe left_shoulder + right_shoulder）
+    - scale 仍用 bbox 兜底（max 保证覆盖，1.05 余量），但 anchor 是
+      肩线中点，scale 与 anchor 解耦
+    - 衣领在 warp 后的位置由"肩线对齐 + bbox 高度"共同决定，不再
+      受 anchor 单一控制——领型自适应
 
     Args:
         clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
         clothing_mask: 衣服二值 mask (Hc, Wc)
         clothing_pts / body_pts: 轮廓采样点，用于估算 bbox
-        clothing_anchor: 衣服领口锚点 (x, y)
-        body_anchor: 人体脖子锚点 (x, y)
+        clothing_anchor: 衣服肩线中点 (x, y)
+        body_anchor: 人体肩线中点 (x, y)
         out_shape: 输出图尺寸 (H, W)
 
     Returns:
@@ -204,6 +213,8 @@ def _warp_affine_stage_a(
     dst_h = max(dy_max - dy_min, 1)
     scale = max(dst_w / src_w, dst_h / src_h) * 1.05
 
+    # 肩线中点兜底：若 main.py 没传，用 bbox 顶部中点（应只在测试场景
+    # 触发，run 子命令一定会传 shoulder keypoint）。
     if clothing_anchor is None:
         clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
     if body_anchor is None:
@@ -215,7 +226,7 @@ def _warp_affine_stage_a(
     ty = by - cy * scale
     logger.info(
         "Stage A affine: scale=%.4f  tx=%.1f  ty=%.1f  "
-        "(clothing_anchor=(%.0f,%.0f) → body_anchor=(%.0f,%.0f))",
+        "(clothing_shoulder=(%.0f,%.0f) → body_shoulder=(%.0f,%.0f))",
         scale, tx, ty, cx, cy, bx, by,
     )
     M_aff = np.array([
