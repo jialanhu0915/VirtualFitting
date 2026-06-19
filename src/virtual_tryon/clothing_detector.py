@@ -328,36 +328,37 @@ class ClothingDetector:
                 cv2.circle(v, p, 10, (0, 0, 0), 2)
             cv2.imwrite(str(_DEBUG_DIR / "clothing_4_shoulder_pts.png"), v)
 
-        # 3. 腋下
-        armpit_band_top = int(shoulder_band_bottom + ch * 0.03)
-        armpit_band_bottom = int(neck_center[1] + ch * 0.50)
-        left_armpit, right_armpit = ClothingDetector._left_right_extrema(
-            pts_sorted, armpit_band_top, armpit_band_bottom
-        )
-        if vis is not None:
-            v = vis.copy()
-            cv2.rectangle(v, (0, armpit_band_top),
-                          (v.shape[1], armpit_band_bottom), (0, 165, 255), 2)
-            for p, c in [(left_armpit, (255, 0, 0)), (right_armpit, (0, 0, 255))]:
-                cv2.circle(v, p, 10, c, -1)
-                cv2.circle(v, p, 10, (0, 0, 0), 2)
-            cv2.imwrite(str(_DEBUG_DIR / "clothing_5_armpit_pts.png"), v)
-
-        # 4. 胯部：在旧腋下带底部到 y_max 之间找衣身最大宽度的 y。
+        # 3. 胯部：在旧腋下带底部到 y_max 之间找衣身最大宽度的 y。
         #   短款 T 恤：最大宽度 ≈ 下摆位置（接近 y_max）
         #   长款旗袍：最大宽度在衣身中段（自适应，不需按比例推算）
+        #   必须先算：第 4 步 armpit 扫描范围依赖 hip_y。
         hip_y, left_hip, right_hip = ClothingDetector._find_max_width_y(
-            pts_sorted, int(armpit_band_bottom), y_max
+            pts_sorted, int(neck_center[1] + ch * 0.50), y_max
         )
         if vis is not None:
             v = vis.copy()
-            cv2.rectangle(v, (0, int(armpit_band_bottom)),
+            cv2.rectangle(v, (0, int(neck_center[1] + ch * 0.50)),
                           (v.shape[1], y_max), (255, 0, 255), 2)
             cv2.line(v, (0, hip_y), (v.shape[1], hip_y), (0, 255, 255), 1)
             for p, c in [(left_hip, (255, 0, 0)), (right_hip, (0, 0, 255))]:
                 cv2.circle(v, p, 10, c, -1)
                 cv2.circle(v, p, 10, (0, 0, 0), 2)
-            cv2.imwrite(str(_DEBUG_DIR / "clothing_6_hip_pts.png"), v)
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_5_hip_pts.png"), v)
+
+        # 4. 腋下：在 shoulder_y 到 hip_y 之间找宽度骤增处。
+        #   "骤增"= 衣身 + 袖子宽度 > 衣身宽度，对应袖子伸出起点。
+        #   无骤增（无袖款）退化为范围内最宽 y（接近 hip）。
+        shoulder_y = (left_shoulder[1] + right_shoulder[1]) // 2
+        left_armpit, right_armpit = ClothingDetector._find_armpit_y(
+            pts_sorted, shoulder_y, hip_y
+        )
+        if vis is not None:
+            v = vis.copy()
+            cv2.rectangle(v, (0, shoulder_y), (v.shape[1], hip_y), (0, 165, 255), 2)
+            for p, c in [(left_armpit, (255, 0, 0)), (right_armpit, (0, 0, 255))]:
+                cv2.circle(v, p, 10, c, -1)
+                cv2.circle(v, p, 10, (0, 0, 0), 2)
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_6_armpit_pts.png"), v)
 
         def mk(name: str, p: tuple[int, int]) -> Keypoint:
             return Keypoint(int(p[0]), int(p[1]), name=name)
@@ -420,4 +421,91 @@ class ClothingDetector:
             best_y,
             (int(lx[best_idx]), best_y),
             (int(rx[best_idx]), best_y),
+        )
+
+    @staticmethod
+    def _find_armpit_y(
+        pts: np.ndarray, y_lo: int, y_hi: int,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """在 y ∈ [y_lo, y_hi] 内找宽度 w(y) 骤增处的左右极值（袖子和衣身分界）。
+
+        平铺衣服的轮廓宽度 w(y) 沿 y 变化的物理意义：衣身段相对稳定，
+        进入袖子后宽度突然增大（袖子伸出方向）。对 w(y) 高斯平滑后差分
+        dw/dy，取首个 dw/dy > 3 * median(|dw/dy|) 的位置——即袖子起点。
+
+        无骤增（无袖款）退化为范围内最宽 y 处的左右极值（接近 hip）。
+
+        Returns:
+            ((left_x, armpit_y), (right_x, armpit_y))。
+            区间内无点时返回 ((0, 0), (0, 0))。
+        """
+        if y_hi <= y_lo:
+            return (0, 0), (0, 0)
+        band = pts[(pts[:, 1] >= y_lo) & (pts[:, 1] <= y_hi)]
+        if len(band) < 2:
+            return (0, 0), (0, 0)
+        # 每行左右极值（与 _find_max_width_y 同款 scatter min/max）
+        ys, inv = np.unique(band[:, 1].astype(np.int32), return_inverse=True)
+        xs = band[:, 0].astype(np.int32)
+        lx = np.full(ys.shape, np.iinfo(np.int32).max, dtype=np.int32)
+        rx = np.full(ys.shape, np.iinfo(np.int32).min, dtype=np.int32)
+        np.minimum.at(lx, inv, xs)
+        np.maximum.at(rx, inv, xs)
+        widths = (rx - lx).astype(np.float32)
+
+        if len(widths) < 2:
+            idx = 0
+            return (int(lx[idx]), int(ys[idx])), (int(rx[idx]), int(ys[idx]))
+
+        # 高斯平滑 w(y)（1D 用 cv2.GaussianBlur 的 2D 接口），核长 7。
+        ksize = min(7, len(widths) // 2 * 2 + 1)
+        if ksize >= 3:
+            w_smooth = cv2.GaussianBlur(
+                widths.reshape(1, -1), (ksize, 1), 0,
+            ).ravel()
+        else:
+            w_smooth = widths
+
+        # 差分 dw/dy，找首个骤增。
+        dw = np.diff(w_smooth)
+        if len(dw) == 0:
+            idx = 0
+            return (int(lx[idx]), int(ys[idx])), (int(rx[idx]), int(ys[idx]))
+
+        threshold = max(float(np.median(np.abs(dw))) * 3.0, 1.0)
+        # argmax 在全 False 时返回 0，所以用 np.where 拿首个 True idx。
+        jump_idx_arr = np.where(dw > threshold)[0]
+        if len(jump_idx_arr) == 0:
+            # 无袖款：退化为范围内最宽 y
+            best_idx = int(np.argmax(widths))
+            return (
+                (int(lx[best_idx]), int(ys[best_idx])),
+                (int(rx[best_idx]), int(ys[best_idx])),
+            )
+
+        # 过滤掉起点附近的"伪 jump"（领口 V 形斜坡、轮廓噪声等）。
+        # 要求 jump 位置在扫描区间起点 y_lo 下方至少 5% 区间长度
+        # （或 5 像素，取较大者），否则视为噪声退化。
+        interval_len = y_hi - y_lo
+        min_offset = max(interval_len // 20, 5)
+        # jump_idx_arr 是 diff 后的索引，对应原 ys[jump_idx + 1]；
+        # 我们关心的是 best_y - y_lo >= min_offset。
+        valid = np.array([
+            (int(ys[j + 1]) - y_lo) >= min_offset for j in jump_idx_arr
+        ], dtype=bool)
+        valid_jumps = jump_idx_arr[valid]
+        if len(valid_jumps) == 0:
+            # 噪声或无袖：退化为范围内最宽 y
+            best_idx = int(np.argmax(widths))
+            return (
+                (int(lx[best_idx]), int(ys[best_idx])),
+                (int(rx[best_idx]), int(ys[best_idx])),
+            )
+
+        # diff 之后 y 索引对应原索引 +1
+        jump_idx = int(valid_jumps[0])
+        best_y = int(ys[jump_idx + 1])
+        return (
+            (int(lx[jump_idx + 1]), best_y),
+            (int(rx[jump_idx + 1]), best_y),
         )
