@@ -383,6 +383,16 @@ def _warp_flow(
     top_idx = 0                                # ys_query[0] == top_y
     s[top_idx] = 1.0
     t[top_idx] = 0.0
+
+    # V 领保留区：anchor 下方前 K 个 sample 强制 s=1, t=0，不参与 per-row fit。
+    # 原因：V 领开口很窄（cloth_w ≈ 17-69 px），身体同位置宽 45-187 px，
+    # 流水式 fit 规则会把 V 领 cloth 强行拉伸成一条横向 ribbon（s ≈ 1.5 + t 巨大
+    # 负值）。保留 V 领形状才是真实穿着的样子（V 领不拉伸，只在 chest 才开始 fit）。
+    V_NECK_SAMPLES = 3
+    for i in range(1, min(V_NECK_SAMPLES + 1, n_samples)):
+        s[i] = 1.0
+        t[i] = 0.0
+
     used = valid | (np.arange(n_samples) == top_idx)
 
     ys_used = ys_query[used]
