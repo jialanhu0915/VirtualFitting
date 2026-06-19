@@ -257,6 +257,11 @@ def _warp_tps(
     bx, by = body_anchor
     tx = bx - cx * scale
     ty = by - cy * scale
+    logger.info(
+        "Stage A affine: scale=%.4f  tx=%.1f  ty=%.1f  "
+        "(clothing_anchor=(%.0f,%.0f) → body_anchor=(%.0f,%.0f))",
+        scale, tx, ty, cx, cy, bx, by,
+    )
     M_aff = np.array([
         [scale, 0, tx],
         [0, scale, ty],

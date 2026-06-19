@@ -16,6 +16,7 @@ import logging
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 # 把 src/ 加入 sys.path，让仓库内的包可以直接被 import，
@@ -203,6 +204,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         method=args.warp_method,
         semantic_pairs=semantic_pairs,
     )
+
+    # Debug overlay 1: body_pts 叠加在 person 图
+    body_vis = person_img.copy()
+    pts_i = body_pts.astype(np.int32).reshape((-1, 1, 2))
+    cv2.polylines(body_vis, [pts_i], isClosed=True, color=(0, 255, 255), thickness=2)
+    save_image(out_dir / "debug_body_pts.jpg", body_vis)
+
+    # Debug overlay 2: clothing_pts + 领口锚点叠加在 clothing 图
+    if clothing_img.shape[2] == 4:
+        cloth_vis = np.ascontiguousarray(clothing_img[:, :, :3])
+    else:
+        cloth_vis = clothing_img.copy()
+    cpts_i = clothing_pts.astype(np.int32).reshape((-1, 1, 2))
+    cv2.polylines(cloth_vis, [cpts_i], isClosed=True, color=(255, 0, 255), thickness=2)
+    cx_anchor, cy_anchor = int(cloth_anchor[0]), int(cloth_anchor[1])
+    cv2.drawMarker(
+        cloth_vis, (cx_anchor, cy_anchor), (0, 255, 255),
+        markerType=cv2.MARKER_CROSS, markerSize=20, thickness=3,
+    )
+    save_image(out_dir / "debug_clothing_pts.jpg", cloth_vis)
+
+    # Debug overlay 3: warped_mask 染色叠加在 person 图（半透明青色）
+    overlay = person_img.copy()
+    overlay[warped_mask > 0] = (
+        overlay[warped_mask > 0] * 0.5 + np.array([0, 255, 255], dtype=np.float32) * 0.5
+    ).astype(np.uint8)
+    save_image(out_dir / "debug_warped_mask_overlay.jpg", overlay)
 
     # 5. 融合
     result = blend(person_img, warped_rgb, warped_mask)
