@@ -53,54 +53,50 @@ def _body_silhouette_per_row(
 
 
 def _build_body_regions(
-    body_pts: np.ndarray, out_shape: tuple[int, int],
+    kpts: dict, out_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """基于 body_pts 顶点构造 3 个区域 mask（躯干/左袖/右袖）。
+    """基于 MediaPipe 关键点用 3 个多边形构造 区域 mask。
 
-    body_pts 顶点顺序（10 点 arm-aware）：
+    顶点顺序（同 _compute_body_verts）：
         0 neck_top, 1 lsh, 2 larmpit, 3 lelbow, 4 lwrist,
-        5 bottom_center, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
+        5 bottom, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
 
-    区域：
-      躯干: neck_top → lsh(顶点1) → lhip line 到底中 → rhip line 到 rsh(顶点9)
-      左袖: 顶点 1-4 之间的"袖子带"（肩外 → 腋 → 腕内侧 → 腕外）
-      右袖: 镜像
+    区域（用 cv2.fillPoly）：
+      躯干:  [neck_top, lsh, larmpit, bottom, rarmpit, rsh]
+             颈顶 → 左肩 → 左腋 → 底中 → 右腋 → 右肩 → 回颈顶
+             腋→底 这两条边把躯干与袖子切开。
+      左袖:  [lsh, larmpit, lelbow, lwrist]
+             肩→腋→肘→腕 回肩（外缘沿真实手臂，内缘腕到肩的连线）。
+             位于图像坐标右侧。
+      右袖:  [rsh, rarmpit, relbow, rwrist] 镜像，位于图像坐标左侧。
 
     Returns:
         (mask_torso, mask_lsleeve, mask_rsleeve) — 三个 (H, W) bool 数组。
-        同一像素可能被多个 mask 覆盖（袖子/躯干交接处）；用 np.logical_or
-        累加，最终优先级：lsleeve > rsleeve > torso。
     """
+    # 局部 import：避免循环依赖（warp.py 不强依赖 human_detector 的全模块）
+    from .human_detector import _compute_body_verts
+    import cv2 as _cv2
+
     H, W = out_shape
-    # body_pts 是采样后的（n_points 个），不是 10 个原顶点——不能直接用
-    # "第 1 个 = lsh"这种假设。改用极值法：
+    v = _compute_body_verts(kpts)
 
-    pts = body_pts
-    x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
-    y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
+    torso_poly = np.array([
+        v[0], v[1], v[2], v[5], v[8], v[9],
+    ], dtype=np.int32)
+    lsleeve_poly = np.array([
+        v[1], v[2], v[3], v[4],
+    ], dtype=np.int32)
+    rsleeve_poly = np.array([
+        v[9], v[8], v[7], v[6],
+    ], dtype=np.int32)
 
-    # 区域 1（躯干）：用 x 的"中间 60%" 作为躯干，y 范围 = 整个 body
-    # （手臂外缘 x 偏离躯干 > 30px 才算袖子，所以袖子 = 身体外侧 20%）
-    torso_x_lo = x_min + 0.20 * (x_max - x_min)
-    torso_x_hi = x_min + 0.80 * (x_max - x_min)
-    yy, xx = np.mgrid[0:H, 0:W]
-    mask_torso = (xx >= torso_x_lo) & (xx <= torso_x_hi) \
-        & (yy >= y_min) & (yy <= y_max)
-
-    # 区域 2/3（袖子）：取身体 x 外侧 22% 范围。y 范围 = 腋下到腕。
-    # 用 body_pts y 分布的 25% 和 95% 分位近似"腋下"和"腕"。
-    ys_sorted = np.sort(pts[:, 1])
-    armpit_y = float(ys_sorted[int(len(ys_sorted) * 0.30)])
-    wrist_y = float(ys_sorted[int(len(ys_sorted) * 0.95)])
-
-    # 左袖：图像坐标右侧（x 大），x >= torso_x_hi
-    mask_lsleeve = (xx >= torso_x_hi) \
-        & (yy >= armpit_y) & (yy <= wrist_y)
-    # 右袖：图像坐标左侧（x 小），x <= torso_x_lo
-    mask_rsleeve = (xx <= torso_x_lo) \
-        & (yy >= armpit_y) & (yy <= wrist_y)
-
-    return mask_torso, mask_lsleeve, mask_rsleeve
+    mask_torso = np.zeros((H, W), dtype=np.uint8)
+    mask_lsleeve = np.zeros((H, W), dtype=np.uint8)
+    mask_rsleeve = np.zeros((H, W), dtype=np.uint8)
+    _cv2.fillPoly(mask_torso, [torso_poly], 1)
+    _cv2.fillPoly(mask_lsleeve, [lsleeve_poly], 1)
+    _cv2.fillPoly(mask_rsleeve, [rsleeve_poly], 1)
+    return mask_torso.astype(bool), mask_lsleeve.astype(bool), mask_rsleeve.astype(bool)
 
 
 def _region_silhouette_per_row(
@@ -251,6 +247,7 @@ def _warp_flow(
     stage_a_rgb: np.ndarray,
     stage_a_mask: np.ndarray,
     body_pts: np.ndarray,
+    kpts: dict,
     out_shape: tuple[int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Stage B: 流水式逐行 stretch（分块 fit）。
@@ -292,7 +289,7 @@ def _warp_flow(
 
     # 3 个区域 mask (H, W) bool
     mask_torso, mask_lsleeve, mask_rsleeve = _build_body_regions(
-        body_pts, (H_out, W_out),
+        kpts, (H_out, W_out),
     )
 
     # 为 region_id 提供优先级：lsleeve > rsleeve > torso
@@ -471,6 +468,7 @@ def warp_clothing(
     clothing_anchor: tuple[float, float] | None = None,
     body_anchor: tuple[float, float] | None = None,
     method: str = "flow",
+    human_kpts: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
 
@@ -484,6 +482,8 @@ def warp_clothing(
         body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
         method: ``"flow"``（默认）Stage A 仿射 + Stage B 流水式逐行 fit
             （含长袖分块）；``"affine"`` 只做 Stage A 仿射（无流水式 fit）。
+        human_kpts: MediaPipe 人体关键点，flow 路径下用于构造 region 多边形；
+            method="affine" 时忽略。
 
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
@@ -505,7 +505,9 @@ def warp_clothing(
         body_anchor=body_anchor,
         out_shape=out_shape,
     )
-    return _warp_flow(stage_a_rgb, stage_a_mask, body_contour, out_shape)
+    if human_kpts is None:
+        raise ValueError("method='flow' 需要 human_kpts 用于构造 region 多边形")
+    return _warp_flow(stage_a_rgb, stage_a_mask, body_contour, human_kpts, out_shape)
 
 
 def blend(

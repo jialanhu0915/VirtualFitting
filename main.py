@@ -188,6 +188,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         clothing_anchor=cloth_anchor,
         body_anchor=body_anchor,
         method=args.warp_method,
+        human_kpts=human_kpts,
     )
 
     # Debug overlay 1: body_pts 叠加在 person 图

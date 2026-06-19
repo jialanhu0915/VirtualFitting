@@ -315,6 +315,103 @@ class RobustHumanDetector(HumanDetector):
         raise RuntimeError(f"所有人体检测器均失败，最后错误: {last_err}")
 
 
+def _compute_body_verts(
+    kpts: dict[str, Keypoint],
+) -> np.ndarray:
+    """从 MediaPipe 关键点算出 10 个命名顶点（不含外扩/采样）。
+
+    顶点（顺时针，从 neck_top 沿左半身体到右半）：
+        0 neck_top, 1 lsh, 2 larmpit, 3 lelbow, 4 lwrist,
+        5 bottom, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
+
+    当 MediaPipe 缺少 wrist 关键点（手被裁出画外等），肘/腕顶点退回到
+    髋部位置（腋下-髋连线中点），让 silhouette 在腋下后向内收到腰线。
+    """
+    required = ["left_shoulder", "right_shoulder",
+                "left_elbow", "right_elbow",
+                "left_hip", "right_hip", "nose"]
+    for name in required:
+        if name not in kpts:
+            raise ValueError(f"缺少人体关键点: {name}")
+
+    ls_x, ls_y = kpts["left_shoulder"].x, kpts["left_shoulder"].y
+    rs_x, rs_y = kpts["right_shoulder"].x, kpts["right_shoulder"].y
+    le_x, le_y = kpts["left_elbow"].x, kpts["left_elbow"].y
+    re_x, re_y = kpts["right_elbow"].x, kpts["right_elbow"].y
+    lh_x, lh_y = kpts["left_hip"].x, kpts["left_hip"].y
+    rh_x, rh_y = kpts["right_hip"].x, kpts["right_hip"].y
+    nose_y = kpts["nose"].y
+
+    has_lw = "left_wrist" in kpts
+    has_rw = "right_wrist" in kpts
+    lw_x = kpts["left_wrist"].x if has_lw else None
+    lw_y = kpts["left_wrist"].y if has_lw else None
+    rw_x = kpts["right_wrist"].x if has_rw else None
+    rw_y = kpts["right_wrist"].y if has_rw else None
+
+    cx = (ls_x + rs_x) / 2
+    shoulder_y = (ls_y + rs_y) / 2
+
+    # neck_top：肩线以上（衣服领口覆盖上界）。0.30 与主流程 body_anchor 偏移一致。
+    neck_top_y = shoulder_y - (shoulder_y - nose_y) * 0.30
+
+    # 腋下 y：肩到肘的中点（臂开始脱离躯干的高度）
+    armpit_y_l = ls_y + (le_y - ls_y) * 0.50
+    armpit_y_r = rs_y + (re_y - rs_y) * 0.50
+
+    # 关节中心→身体外缘 padding。
+    shoulder_pad = 8
+    hip_pad = 30
+    elbow_pad = 5
+    wrist_pad = 3
+
+    lsh_x = ls_x + shoulder_pad
+    rsh_x = rs_x - shoulder_pad
+    larmpit_x = lsh_x
+    rarmpit_x = rsh_x
+    lhip_x = lh_x + hip_pad
+    rhip_x = rh_x - hip_pad
+
+    if has_lw:
+        lelbow_x = le_x + elbow_pad
+        lwrist_x = lw_x + wrist_pad
+        lwrist_y = lw_y
+    else:
+        leg_y = armpit_y_l + (lh_y - armpit_y_l) * 0.60
+        leg_y2 = armpit_y_l + (lh_y - armpit_y_l) * 0.90
+        lelbow_x = (larmpit_x + lhip_x) / 2
+        lwrist_x = (larmpit_x + lhip_x) / 2
+        lwrist_y = leg_y2
+        le_y = leg_y
+    if has_rw:
+        relbow_x = re_x - elbow_pad
+        rwrist_x = rw_x - wrist_pad
+        rwrist_y = rw_y
+    else:
+        reg_y = armpit_y_r + (rh_y - armpit_y_r) * 0.60
+        reg_y2 = armpit_y_r + (rh_y - armpit_y_r) * 0.90
+        relbow_x = (rarmpit_x + rhip_x) / 2
+        rwrist_x = (rarmpit_x + rhip_x) / 2
+        rwrist_y = reg_y2
+        re_y = reg_y
+
+    bottom_y = max(lh_y, rh_y)
+    bottom_x = (lhip_x + rhip_x) / 2
+
+    return np.array([
+        (cx, neck_top_y),       # 0  neck_top
+        (lsh_x, ls_y),          # 1  左肩外缘
+        (larmpit_x, armpit_y_l),# 2  左腋下
+        (lelbow_x, le_y),       # 3  左肘外缘
+        (lwrist_x, lwrist_y),   # 4  左腕外缘
+        (bottom_x, bottom_y),   # 5  底部中点
+        (rwrist_x, rwrist_y),   # 6  右腕外缘
+        (relbow_x, re_y),       # 7  右肘外缘
+        (rarmpit_x, armpit_y_r),# 8  右腋下
+        (rsh_x, rs_y),          # 9  右肩外缘
+    ], dtype=np.float32)
+
+
 def body_region_contour(
     kpts: dict[str, Keypoint],
     n_points: int = 30,
@@ -342,96 +439,7 @@ def body_region_contour(
         n_points: 采样点数，应与衣服轮廓采样点数一致。
         expand_ratio: 轮廓外扩比例，防止 warp 后衣服边缘露肉。
     """
-    required = ["left_shoulder", "right_shoulder",
-                "left_elbow", "right_elbow",
-                "left_hip", "right_hip", "nose"]
-    for name in required:
-        if name not in kpts:
-            raise ValueError(f"缺少人体关键点: {name}")
-
-    ls_x, ls_y = kpts["left_shoulder"].x, kpts["left_shoulder"].y
-    rs_x, rs_y = kpts["right_shoulder"].x, kpts["right_shoulder"].y
-    le_x, le_y = kpts["left_elbow"].x, kpts["left_elbow"].y
-    re_x, re_y = kpts["right_elbow"].x, kpts["right_elbow"].y
-    lh_x, lh_y = kpts["left_hip"].x, kpts["left_hip"].y
-    rh_x, rh_y = kpts["right_hip"].x, kpts["right_hip"].y
-    nose_y = kpts["nose"].y
-
-    # 腕关键点可选：缺失时手臂段退化（肘/腕顶点在腋下-髋连线上）。
-    has_lw = "left_wrist" in kpts
-    has_rw = "right_wrist" in kpts
-    lw_x = kpts["left_wrist"].x if has_lw else None
-    lw_y = kpts["left_wrist"].y if has_lw else None
-    rw_x = kpts["right_wrist"].x if has_rw else None
-    rw_y = kpts["right_wrist"].y if has_rw else None
-
-    cx = (ls_x + rs_x) / 2
-    shoulder_y = (ls_y + rs_y) / 2
-
-    # neck_top：肩线以上（衣服领口覆盖上界）。0.30 与主流程 body_anchor 偏移一致。
-    neck_top_y = shoulder_y - (shoulder_y - nose_y) * 0.30
-
-    # 腋下 y：肩到肘的中点（臂开始脱离躯干的高度）
-    armpit_y_l = ls_y + (le_y - ls_y) * 0.50
-    armpit_y_r = rs_y + (re_y - rs_y) * 0.50
-
-    # 关节中心→身体外缘 padding。MediaPipe 给的是关节中心，肩/髋外缘
-    # 都在更外侧（subject 的解剖学左右 → image 坐标系相反方向）：
-    #   左肩/左髋（image 右侧）= 关节 x + pad
-    #   右肩/右髋（image 左侧）= 关节 x - pad
-    shoulder_pad = 8      # 三角肌厚度
-    hip_pad = 30          # 髋骨/臀部厚度
-    elbow_pad = 5         # 肘关节中心 → 上臂外缘
-    wrist_pad = 3         # 腕关节中心 → 前臂外缘
-
-    lsh_x = ls_x + shoulder_pad
-    rsh_x = rs_x - shoulder_pad
-    larmpit_x = lsh_x
-    rarmpit_x = rsh_x
-    lhip_x = lh_x + hip_pad
-    rhip_x = rh_x - hip_pad
-
-    # 肘/腕：直接用 MediaPipe 关键点 + pad。如果腕缺失则把肘/腕顶点都
-    # 放在腋下到髋连线上（约 60% 高度），让 silhouette 在腋下后向内收。
-    if has_lw:
-        lelbow_x = le_x + elbow_pad
-        lwrist_x = lw_x + wrist_pad
-        lwrist_y = lw_y
-    else:
-        # 退化：肘在腋下到髋的 60% y，腕在 90% y
-        leg_y = larmpit_y_l + (lh_y - larmpit_y_l) * 0.60
-        leg_y2 = larmpit_y_l + (lh_y - larmpit_y_l) * 0.90
-        lelbow_x = (larmpit_x + lhip_x) / 2
-        lwrist_x = (larmpit_x + lhip_x) / 2
-        lwrist_y = leg_y2
-        le_y = leg_y  # 同时改 le_y 不影响其他计算
-    if has_rw:
-        relbow_x = re_x - elbow_pad
-        rwrist_x = rw_x - wrist_pad
-        rwrist_y = rw_y
-    else:
-        reg_y = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.60
-        reg_y2 = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.90
-        relbow_x = (rarmpit_x + rhip_x) / 2
-        rwrist_x = (rarmpit_x + rhip_x) / 2
-        rwrist_y = reg_y2
-        re_y = reg_y
-
-    bottom_y = max(lh_y, rh_y)
-    bottom_x = (lhip_x + rhip_x) / 2
-
-    verts = np.array([
-        (cx, neck_top_y),       # 0  neck_top（肩线以上）
-        (lsh_x, ls_y),          # 1  左肩外缘
-        (larmpit_x, armpit_y_l),# 2  左腋下（与肩同 x）
-        (lelbow_x, le_y),       # 3  左肘外缘
-        (lwrist_x, lwrist_y),   # 4  左腕外缘
-        (bottom_x, bottom_y),   # 5  底部中点（不模拟腿）
-        (rwrist_x, rwrist_y),   # 6  右腕外缘
-        (relbow_x, re_y),       # 7  右肘外缘
-        (rarmpit_x, armpit_y_r),# 8  右腋下
-        (rsh_x, rs_y),          # 9  右肩外缘
-    ], dtype=np.float32)
+    verts = _compute_body_verts(kpts)
 
     # 外扩 expand_ratio（防止 warp 后边缘露肉）
     if expand_ratio > 0:
