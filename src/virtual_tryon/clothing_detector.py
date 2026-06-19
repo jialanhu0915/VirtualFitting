@@ -343,36 +343,33 @@ class ClothingDetector:
                 cv2.circle(v, p, 10, (0, 0, 0), 2)
             cv2.imwrite(str(_DEBUG_DIR / "clothing_5_armpit_pts.png"), v)
 
-        # 4. 下摆
-        bottom_band_top = int(y_max - ch * 0.05)
-        left_bottom_raw, right_bottom_raw = ClothingDetector._left_right_extrema(
-            pts_sorted, bottom_band_top, y_max
+        # 4. 胯部：在旧腋下带底部到 y_max 之间找衣身最大宽度的 y。
+        #   短款 T 恤：最大宽度 ≈ 下摆位置（接近 y_max）
+        #   长款旗袍：最大宽度在衣身中段（自适应，不需按比例推算）
+        hip_y, left_hip, right_hip = ClothingDetector._find_max_width_y(
+            pts_sorted, int(armpit_band_bottom), y_max
         )
-        bw = right_bottom_raw[0] - left_bottom_raw[0]
-        inset = int(bw * 0.08)
-        left_bottom = (left_bottom_raw[0] + inset, y_max)
-        right_bottom = (right_bottom_raw[0] - inset, y_max)
         if vis is not None:
             v = vis.copy()
-            cv2.rectangle(v, (0, bottom_band_top), (v.shape[1], y_max),
-                          (255, 0, 255), 2)
-            for p, c in [(left_bottom, (255, 0, 0)), (right_bottom, (0, 0, 255))]:
+            cv2.rectangle(v, (0, int(armpit_band_bottom)),
+                          (v.shape[1], y_max), (255, 0, 255), 2)
+            cv2.line(v, (0, hip_y), (v.shape[1], hip_y), (0, 255, 255), 1)
+            for p, c in [(left_hip, (255, 0, 0)), (right_hip, (0, 0, 255))]:
                 cv2.circle(v, p, 10, c, -1)
                 cv2.circle(v, p, 10, (0, 0, 0), 2)
-            cv2.imwrite(str(_DEBUG_DIR / "clothing_6_bottom_pts.png"), v)
+            cv2.imwrite(str(_DEBUG_DIR / "clothing_6_hip_pts.png"), v)
 
         def mk(name: str, p: tuple[int, int]) -> Keypoint:
             return Keypoint(int(p[0]), int(p[1]), name=name)
 
         return {
             "top_center":     mk("top_center",     neck_center),
-            "bottom_center":  mk("bottom_center",  ((left_bottom[0] + right_bottom[0]) // 2, y_max)),
             "left_shoulder":  mk("left_shoulder",  left_shoulder),
             "right_shoulder": mk("right_shoulder", right_shoulder),
             "left_armpit":    mk("left_armpit",    left_armpit),
             "right_armpit":   mk("right_armpit",   right_armpit),
-            "left_bottom":    mk("left_bottom",    left_bottom),
-            "right_bottom":   mk("right_bottom",   right_bottom),
+            "left_hip":       mk("left_hip",       left_hip),
+            "right_hip":      mk("right_hip",      right_hip),
         }
 
     @staticmethod
@@ -388,3 +385,39 @@ class ClothingDetector:
         left = band[np.argmin(band[:, 0])]
         right = band[np.argmax(band[:, 0])]
         return (int(left[0]), int(left[1])), (int(right[0]), int(right[1]))
+
+    @staticmethod
+    def _find_max_width_y(
+        pts: np.ndarray, y_lo: int, y_hi: int,
+    ) -> tuple[int, tuple[int, int], tuple[int, int]]:
+        """在 y ∈ [y_lo, y_hi] 内找衣身宽度最大处的 y 和该 y 处的左右极值。
+
+        "衣身宽度"定义为该 y 行上轮廓点的左右 x 极值之差
+        （w(y) = max_x - min_x）。短款 T 恤的最大宽度在接近 y_max 处
+        （下摆附近），长款旗袍的最大宽度在衣身中段——由衣身自然形状
+        决定，不依赖比例推算。
+
+        Returns:
+            (best_y, (left_x, best_y), (right_x, best_y))。
+            区间内无点时返回 (0, (0, 0), (0, 0))。
+        """
+        if y_hi <= y_lo:
+            return 0, (0, 0), (0, 0)
+        band = pts[(pts[:, 1] >= y_lo) & (pts[:, 1] <= y_hi)]
+        if len(band) < 2:
+            return 0, (0, 0), (0, 0)
+        # 按 y 分组，每行取 x 极值。用 np.minimum.at / maximum.at 一次 scatter
+        ys, inv = np.unique(band[:, 1].astype(np.int32), return_inverse=True)
+        xs = band[:, 0].astype(np.int32)
+        lx = np.full(ys.shape, np.iinfo(np.int32).max, dtype=np.int32)
+        rx = np.full(ys.shape, np.iinfo(np.int32).min, dtype=np.int32)
+        np.minimum.at(lx, inv, xs)
+        np.maximum.at(rx, inv, xs)
+        widths = rx - lx
+        best_idx = int(np.argmax(widths))
+        best_y = int(ys[best_idx])
+        return (
+            best_y,
+            (int(lx[best_idx]), best_y),
+            (int(rx[best_idx]), best_y),
+        )
