@@ -35,6 +35,46 @@ def _align_contours(
     return src, dst
 
 
+def _estimate_similarity_transform(
+    src: np.ndarray, dst: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Umeyama 1991 闭式解：2D 相似变换 (scale, R 2x2, t 2,) 最小化
+    sum ||s · R · src_i + t - dst_i||²。
+
+    用于把衣服轮廓对齐到人体轮廓。Stage A 的核心：从 30 对
+    (clothing_pts, body_pts) 估计一个旋转+缩放+平移变换，让衣服图
+    按这个变换 warp 到人体坐标系，"按身体轮廓贴合"。
+
+    Args:
+        src: (N, 2) 源点（衣服图坐标系）
+        dst: (N, 2) 目标点（人体图坐标系）
+
+    Returns:
+        (scale, R, t) —— 用法 dst_pred = scale * R @ src + t
+    """
+    assert src.shape == dst.shape and src.shape[1] == 2, \
+        f"src/dst must be (N, 2); got {src.shape} / {dst.shape}"
+
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_c = src - src_mean
+    dst_c = dst - dst_mean
+
+    # 协方差矩阵 H = src_c.T @ dst_c
+    H = src_c.T @ dst_c
+    U, S, Vt = np.linalg.svd(H)
+
+    # 处理反射：det(R) 必须为 +1（旋转），不是 -1（镜像）
+    d = float(np.sign(np.linalg.det(Vt.T @ U.T)))
+    D = np.diag([1.0, d])
+    R = Vt.T @ D @ U.T
+
+    var_src = float((src_c ** 2).sum())
+    scale = float(S.sum()) / var_src if var_src > 1e-12 else 1.0
+    t = dst_mean - scale * R @ src_mean
+    return scale, R, t
+
+
 def _tps_coefficients(
     src: np.ndarray, dst: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -160,42 +200,76 @@ def _warp_tps(
     clothing_mask: np.ndarray,
     semantic_pairs: np.ndarray,
     out_shape: tuple[int, int],
+    clothing_pts: np.ndarray,
+    body_pts: np.ndarray,
+    clothing_anchor: tuple[float, float] | None = None,
+    body_anchor: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """用 8 对语义关键点做 TPS warp。
+    """Stage A: 仿射粗定位（按身体外接矩形 + 领口锚点对齐）。
 
-    与早期版本的区别：早期用 30 个 arc-length 采样点做"对应"，
-    但弧长第 i 个点在语义上不对应（衣服第 8 个点是袖口、人体第 8
-    个点是肩下），TPS 强行拉扯会扭曲袖子。本版本用 8 对语义点
-    （领口↔颈、肩↔肩、腋下↔肘、下摆↔髋 + 底中点↔髋中点），
-    由 CORRESPONDENCE 字典给出，语义一一对应。
+    旧"用 8 对语义关键点做 TPS warp"路径是错误的根本方向——TPS
+    按点插值不按轮廓贴合，衣服被按点拉扯成"翼"/"舌头"。Stage A
+    用简单的外接矩形 + 锚点对齐做"按整体轮廓贴合"：
+
+      scale = max(body_w / cloth_w, body_h / cloth_h) * 1.05
+      tx, ty 让 cloth 领口（clothing_anchor）映射到 body 脖子（body_anchor）
+
+    这保证衣服覆盖身体区域（max 保证两个方向都不小于 1.0，加 1.05
+    余量），且领口对齐人体脖子（保证纵向位置正确）。
+
+    Stage B（residual TPS 修正姿态偏差）将在后续 commit 加入。
 
     Args:
         clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
         clothing_mask: 衣服二值 mask (Hc, Wc)
-        semantic_pairs: (n, 2, 2) 数组，semantic_pairs[i, 0] 是衣服关键点
-            （衣服图坐标系），semantic_pairs[i, 1] 是人体关键点（人体图坐标系）。
+        semantic_pairs: 保留参数以兼容接口，Stage A 暂不使用
         out_shape: 输出图尺寸 (H, W)
+        clothing_pts: 衣服轮廓采样点 (n, 2)，衣服图坐标系
+        body_pts: 人体躯干轮廓 (n, 2)，人体图坐标系
+        clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
+        body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
 
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
     """
-    pairs = semantic_pairs.astype(np.float64)
-    src = pairs[:, 0, :]   # clothing 坐标
-    dst = pairs[:, 1, :]   # body 坐标
+    n = min(len(clothing_pts), len(body_pts))
+    src_pts = clothing_pts[:n].astype(np.float32)
+    dst_pts = body_pts[:n].astype(np.float32)
 
-    # 系数以 dst 为 src_ctl：f(body 坐标) -> clothing 坐标。
-    w_x, w_y, a_x, a_y = _tps_coefficients(dst, src)
-    map_x, map_y = _tps_warp_dense(dst, w_x, w_y, a_x, a_y, out_shape)
+    H, W = out_shape
 
-    warped_rgb = cv2.remap(
-        clothing_rgb, map_x, map_y,
-        cv2.INTER_LINEAR,
+    sx_min, sy_min = src_pts[:, 0].min(), src_pts[:, 1].min()
+    sx_max, sy_max = src_pts[:, 0].max(), src_pts[:, 1].max()
+    dx_min, dy_min = dst_pts[:, 0].min(), dst_pts[:, 1].min()
+    dx_max, dy_max = dst_pts[:, 0].max(), dst_pts[:, 1].max()
+    src_w = max(sx_max - sx_min, 1)
+    src_h = max(sy_max - sy_min, 1)
+    dst_w = max(dx_max - dx_min, 1)
+    dst_h = max(dy_max - dy_min, 1)
+    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
+
+    if clothing_anchor is None:
+        clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
+    if body_anchor is None:
+        body_anchor = (float(dx_min + dx_max) / 2, float(dy_min))
+
+    cx, cy = clothing_anchor
+    bx, by = body_anchor
+    tx = bx - cx * scale
+    ty = by - cy * scale
+    M_aff = np.array([
+        [scale, 0, tx],
+        [0, scale, ty],
+    ], dtype=np.float32)
+
+    warped_rgb = cv2.warpAffine(
+        clothing_rgb, M_aff, (W, H),
+        flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
     )
-    # mask 用最近邻保持二值性，理由同 TPS 路径注释。
-    warped_mask = cv2.remap(
-        clothing_mask, map_x, map_y,
-        cv2.INTER_NEAREST,
+    warped_mask = cv2.warpAffine(
+        clothing_mask, M_aff, (W, H),
+        flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
     return warped_rgb, warped_mask
@@ -236,6 +310,9 @@ def warp_clothing(
         return _warp_tps(
             clothing_rgb, clothing_mask,
             cast(np.ndarray, semantic_pairs), out_shape,
+            clothing_contour, body_contour,
+            clothing_anchor=clothing_anchor,
+            body_anchor=body_anchor,
         )
 
     n = min(len(clothing_contour), len(body_contour))
