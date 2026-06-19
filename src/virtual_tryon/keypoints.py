@@ -60,24 +60,34 @@ HUMAN_KEYPOINTS_USED: set[str] = {
 }
 
 
-# 从平铺服装图中提取的 8 个关键点。
+# 从平铺服装图中提取的 7 个关键点。
+# 旧版 8 点里有 `bottom_center` / `left_bottom` / `right_bottom` 三点，对应
+# 衣服图的最底端——但这语义错位：长款衣服（旗袍/连衣裙到脚踝）的最底端
+# 不应对应人体的髋。现在改成 `left_hip` / `right_hip`，由检测器在**衣身
+# 最大宽度处**派生（短款 T 恤 ≈ 下摆；长款旗袍 ≈ 衣身中段），自适应。
 CLOTHING_KEYPOINTS: set[str] = {
-    "top_center", "bottom_center",
+    "top_center",
     "left_shoulder", "right_shoulder",
     "left_armpit", "right_armpit",
-    "left_bottom", "right_bottom",
+    "left_hip", "right_hip",
 }
 
 
 # 服装关键点 -> 人体关键点的对应关系。
 # 该表是试衣流水线的核心配置：它决定了 TPS/仿射变换如何把服装
 # 上的每个语义点对齐到人体的对应部位。
+#
+# `armpit` 对应人体的 `shoulder`：MediaPipe Pose 33 点里没有"腋下"关键点。
+# 之前用 `elbow` 是"穿上后大致到肘"的近似，但这就是袖子两侧"翼"的根因
+# 之一（袖窿被强行拉到肘外侧，袖子跟着扭曲）。改为 `shoulder` 后语义更清晰：
+# 衣服腋下 ≈ 身体肩部水平位置；TPS 控制点的实际 dst 位置由 main.py 的
+# _cover_outpush 沿"neck→hip中点"法向外推，覆盖肩部外缘。
 CORRESPONDENCE: dict[str, str] = {
     "top_center":     "neck",           # 领口中心  -> 脖子（双肩中点）
     "left_shoulder":  "left_shoulder",
     "right_shoulder": "right_shoulder",
-    "left_armpit":    "left_elbow",     # 腋下  -> 肘
-    "right_armpit":   "right_elbow",
-    "left_bottom":    "left_hip",       # 下摆  -> 髋
-    "right_bottom":   "right_hip",
+    "left_armpit":    "left_shoulder",  # 衣服腋下 -> 身体肩部（同高）
+    "right_armpit":   "right_shoulder",
+    "left_hip":       "left_hip",       # 衣服胯部  -> 人体髋
+    "right_hip":      "right_hip",
 }
