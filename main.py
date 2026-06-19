@@ -236,9 +236,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     result = blend(person_img, warped_rgb, warped_mask)
     save_image(out_dir / "result.jpg", result)
 
-    # 中间产物
-    save_image(out_dir / "warped_clothing.jpg", warped_rgb)
-    save_image(out_dir / "warped_mask.jpg", warped_mask)
+    # 中间产物用 PNG（lossless）——JPEG 压缩对 RGB 和 mask 通道处理不一致，
+    # 会在 cloth 边界产生"暴力偏移"假象（mask 压缩严，RGB 压缩松，cloth 边缘
+    # 看起来比 mask 大几百像素）。PNG 无损就不会有这问题。
+    save_image(out_dir / "warped_clothing.png", warped_rgb)
+    save_image(out_dir / "warped_mask.png", warped_mask)
 
     logger.info("输出已写入 %s", out_dir)
     return 0
