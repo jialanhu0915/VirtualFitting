@@ -322,53 +322,79 @@ def body_region_contour(
 ) -> np.ndarray:
     """从 MediaPipe 关键点提取躯干区域轮廓。
 
-    用肩-腋-腰-髋围成的多边形近似"衣服应该覆盖的身体区域"，
-    然后沿多边形边均匀采样 n_points 个点。
+    多边形按真实人体形状设计（旧 v3 版的形状有几何错误，会让流水式 fit
+    出沙漏轮廓）：
+    - 顶部 neck_top 在肩线以上（不再是平直肩线）
+    - 腋下与肩同 x（不再向内凹——臂从此处开始离开躯干）
+    - 髋部向外扩到外缘（MediaPipe hip 是关节中心，不是髋外缘）
+    - 底部仍是单点（不模拟腿）
+
+    顶点（顺时针）：neck_top → 左肩 → 左腋 → 左髋 → 底中 → 右髋 → 右腋 → 右肩。
 
     Args:
         kpts: MediaPipe / RobustHumanDetector 返回的 33 关键点。
         n_points: 采样点数，应与衣服轮廓采样点数一致。
         expand_ratio: 轮廓外扩比例，防止 warp 后衣服边缘露肉。
     """
-    # 需要的关键点（按 MediaPipe 命名）
     required = ["left_shoulder", "right_shoulder",
-                "left_hip", "right_hip", "neck"]
+                "left_elbow", "right_elbow",
+                "left_hip", "right_hip", "nose"]
     for name in required:
         if name not in kpts:
             raise ValueError(f"缺少人体关键点: {name}")
 
-    ls = (kpts["left_shoulder"].x, kpts["left_shoulder"].y)
-    rs = (kpts["right_shoulder"].x, kpts["right_shoulder"].y)
-    lh = (kpts["left_hip"].x, kpts["left_hip"].y)
-    rh = (kpts["right_hip"].x, kpts["right_hip"].y)
-    neck = (kpts["neck"].x, kpts["neck"].y)
+    ls_x, ls_y = kpts["left_shoulder"].x, kpts["left_shoulder"].y
+    rs_x, rs_y = kpts["right_shoulder"].x, kpts["right_shoulder"].y
+    le_y = kpts["left_elbow"].y
+    re_y = kpts["right_elbow"].y
+    lh_x, lh_y = kpts["left_hip"].x, kpts["left_hip"].y
+    rh_x, rh_y = kpts["right_hip"].x, kpts["right_hip"].y
+    nose_y = kpts["nose"].y
 
-    # 左右腋下近似：肩→髋 的 1/3 处（臂窝通常在躯干上部）。
-    l_armpit = (int(ls[0] + (lh[0] - ls[0]) * 0.30),
-                int(ls[1] + (lh[1] - ls[1]) * 0.30))
-    r_armpit = (int(rs[0] + (rh[0] - rs[0]) * 0.30),
-                int(rs[1] + (rh[1] - rs[1]) * 0.30))
-    # 底部中点
-    bottom = ((lh[0] + rh[0]) // 2, max(lh[1], rh[1]))
+    cx = (ls_x + rs_x) / 2
+    shoulder_y = (ls_y + rs_y) / 2
 
-    # 躯干多边形顶点（逆时针：左肩 → 左腋 → 左髋 → 底中点 → 右髋 → 右腋 → 右肩 → 颈）
+    # neck_top：肩线以上（衣服领口覆盖上界）。0.30 与主流程 body_anchor 偏移一致。
+    neck_top_y = shoulder_y - (shoulder_y - nose_y) * 0.30
+
+    # 腋下 y：肩到肘的中点（臂开始脱离躯干的高度）
+    armpit_y_l = ls_y + (le_y - ls_y) * 0.50
+    armpit_y_r = rs_y + (re_y - rs_y) * 0.50
+
+    # 关节中心→身体外缘 padding。MediaPipe 给的是关节中心，肩/髋外缘
+    # 都在更外侧（subject 的解剖学左右 → image 坐标系相反方向）：
+    #   左肩/左髋（image 右侧）= 关节 x + pad
+    #   右肩/右髋（image 左侧）= 关节 x - pad
+    shoulder_pad = 8      # 三角肌厚度
+    hip_pad = 30          # 髋骨/臀部厚度
+
+    lsh_x = ls_x + shoulder_pad
+    rsh_x = rs_x - shoulder_pad
+    larmpit_x = lsh_x
+    rarmpit_x = rsh_x
+    lhip_x = lh_x + hip_pad
+    rhip_x = rh_x - hip_pad
+
+    bottom_y = max(lh_y, rh_y)
+    bottom_x = (lhip_x + rhip_x) / 2
+
     verts = np.array([
-        neck,                          # 0  颈
-        ls,                            # 1  左肩
-        l_armpit,                      # 2  左腋下近似
-        lh,                            # 3  左髋
-        bottom,                        # 4  底部中点
-        rh,                            # 5  右髋
-        r_armpit,                      # 6  右腋下近似
-        rs,                            # 7  右肩
+        (cx, neck_top_y),       # 0  neck_top（肩线以上）
+        (lsh_x, ls_y),          # 1  左肩外缘
+        (larmpit_x, armpit_y_l),# 2  左腋下（与肩同 x）
+        (lhip_x, lh_y),         # 3  左髋外缘
+        (bottom_x, bottom_y),   # 4  底部中点（不模拟腿）
+        (rhip_x, rh_y),         # 5  右髋外缘
+        (rarmpit_x, armpit_y_r),# 6  右腋下
+        (rsh_x, rs_y),          # 7  右肩外缘
     ], dtype=np.float32)
 
-    # 外扩一点（按 expand_ratio），避免 warp 后衣服边缘露肉。
+    # 外扩 expand_ratio（防止 warp 后边缘露肉）
     if expand_ratio > 0:
-        cx = verts[:, 0].mean()
-        cy = verts[:, 1].mean()
+        cx_v = verts[:, 0].mean()
+        cy_v = verts[:, 1].mean()
         for i in range(len(verts)):
-            dx, dy = verts[i][0] - cx, verts[i][1] - cy
+            dx, dy = verts[i][0] - cx_v, verts[i][1] - cy_v
             dist = np.sqrt(dx * dx + dy * dy) + 1e-6
             verts[i][0] += dx / dist * expand_ratio * (abs(dx) + abs(dy))
             verts[i][1] += dy / dist * expand_ratio * (abs(dx) + abs(dy))

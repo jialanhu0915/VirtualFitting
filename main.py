@@ -306,8 +306,9 @@ def main() -> int:
         help="忽略人体关键点缓存，强制重新跑模型",
     )
     p_run.add_argument(
-        "--warp-method", choices=["affine", "tps"], default="affine",
-        help="warp 算法：affine=等比缩放+对齐（默认），tps=薄板样条非线性形变",
+        "--warp-method", choices=["affine", "flow", "tps"], default="affine",
+        help="warp 算法：affine=Stage A 仿射（默认）；flow=Stage A+流水式逐行 fit；"
+             "tps=薄板样条非线性形变（已不推荐）",
     )
     p_run.set_defaults(func=cmd_run)
 

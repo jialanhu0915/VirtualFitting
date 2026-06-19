@@ -195,6 +195,261 @@ def _tps_warp_dense(
            out[:, 1].reshape(H, W).astype(np.float32)
 
 
+def _body_silhouette_per_row(
+    body_pts: np.ndarray, ys: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """对每个 y 求身体轮廓左右边（多边形边插值）。
+
+    body_pts 是闭合多边形（N, 2）。对每条边 (x1,y1)→(x2,y2)，若 y 在该边
+    的 y 跨度内，线性插值得到该 y 处的 x；所有跨越该 y 的边的 x 取 min/max
+    即为左右边。
+
+    y 在多边形 y 范围外的返回 NaN（应跳过）。
+    """
+    n = len(body_pts)
+    body_left = np.full(len(ys), np.inf, dtype=np.float64)
+    body_right = np.full(len(ys), -np.inf, dtype=np.float64)
+
+    for i in range(n):
+        x1, y1 = float(body_pts[i, 0]), float(body_pts[i, 1])
+        x2, y2 = float(body_pts[(i + 1) % n, 0]), float(body_pts[(i + 1) % n, 1])
+        if y1 == y2:
+            continue
+        y_lo, y_hi = (y1, y2) if y1 < y2 else (y2, y1)
+        mask = (ys >= y_lo) & (ys <= y_hi)
+        if not mask.any():
+            continue
+        t_edge = (ys[mask] - y1) / (y2 - y1)
+        x_interp = x1 + t_edge * (x2 - x1)
+        body_left[mask] = np.minimum(body_left[mask], x_interp)
+        body_right[mask] = np.maximum(body_right[mask], x_interp)
+
+    body_left[~np.isfinite(body_left)] = np.nan
+    body_right[~np.isfinite(body_right)] = np.nan
+    return body_left, body_right
+
+
+def _cloth_silhouette_per_row(
+    cloth_mask: np.ndarray, ys: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """对每个 y 求衣服 mask 左右边（每行扫描）。
+
+    返回 -1 表示该 y 没有衣服像素。
+    """
+    h, w = cloth_mask.shape
+    yi = np.clip(np.round(ys).astype(int), 0, h - 1)
+    rows = cloth_mask[yi] > 0                       # (n, W) bool
+    has_cloth = rows.any(axis=1)
+    left_idx = np.argmax(rows, axis=1).astype(float)
+    right_idx = (w - 1 - np.argmax(rows[:, ::-1], axis=1)).astype(float)
+    cloth_left = np.where(has_cloth, left_idx, -1.0)
+    cloth_right = np.where(has_cloth, right_idx, -1.0)
+    return cloth_left, cloth_right
+
+
+def _warp_affine_stage_a(
+    clothing_rgb: np.ndarray,
+    clothing_mask: np.ndarray,
+    clothing_pts: np.ndarray,
+    body_pts: np.ndarray,
+    clothing_anchor: tuple[float, float] | None,
+    body_anchor: tuple[float, float] | None,
+    out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stage A: 仿射粗定位（按身体外接矩形 + 领口锚点对齐）。
+
+    旧"用 8 对语义关键点做 TPS warp"路径是错误的根本方向——TPS
+    按点插值不按轮廓贴合，衣服被按点拉扯成"翼"/"舌头"。Stage A
+    用简单的外接矩形 + 锚点对齐做"按整体轮廓贴合"：
+
+      scale = max(body_w / cloth_w, body_h / cloth_h) * 1.05
+      tx, ty 让 cloth 领口（clothing_anchor）映射到 body 脖子（body_anchor）
+
+    这保证衣服覆盖身体区域（max 保证两个方向都不小于 1.0，加 1.05
+    余量），且领口对齐人体脖子（保证纵向位置正确）。
+
+    Args:
+        clothing_rgb: 衣服 RGB 图 (Hc, Wc, 3)
+        clothing_mask: 衣服二值 mask (Hc, Wc)
+        clothing_pts / body_pts: 轮廓采样点，用于估算 bbox
+        clothing_anchor: 衣服领口锚点 (x, y)
+        body_anchor: 人体脖子锚点 (x, y)
+        out_shape: 输出图尺寸 (H, W)
+
+    Returns:
+        warped_rgb, warped_mask — 都对齐到 out_shape（人体图坐标系）
+    """
+    n = min(len(clothing_pts), len(body_pts))
+    src_pts = clothing_pts[:n].astype(np.float32)
+    dst_pts = body_pts[:n].astype(np.float32)
+
+    H, W = out_shape
+
+    sx_min, sy_min = src_pts[:, 0].min(), src_pts[:, 1].min()
+    sx_max, sy_max = src_pts[:, 0].max(), src_pts[:, 1].max()
+    dx_min, dy_min = dst_pts[:, 0].min(), dst_pts[:, 1].min()
+    dx_max, dy_max = dst_pts[:, 0].max(), dst_pts[:, 1].max()
+    src_w = max(sx_max - sx_min, 1)
+    src_h = max(sy_max - sy_min, 1)
+    dst_w = max(dx_max - dx_min, 1)
+    dst_h = max(dy_max - dy_min, 1)
+    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
+
+    if clothing_anchor is None:
+        clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
+    if body_anchor is None:
+        body_anchor = (float(dx_min + dx_max) / 2, float(dy_min))
+
+    cx, cy = clothing_anchor
+    bx, by = body_anchor
+    tx = bx - cx * scale
+    ty = by - cy * scale
+    logger.info(
+        "Stage A affine: scale=%.4f  tx=%.1f  ty=%.1f  "
+        "(clothing_anchor=(%.0f,%.0f) → body_anchor=(%.0f,%.0f))",
+        scale, tx, ty, cx, cy, bx, by,
+    )
+    M_aff = np.array([
+        [scale, 0, tx],
+        [0, scale, ty],
+    ], dtype=np.float32)
+
+    warped_rgb = cv2.warpAffine(
+        clothing_rgb, M_aff, (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    warped_mask = cv2.warpAffine(
+        clothing_mask, M_aff, (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped_rgb, warped_mask
+
+
+def _warp_flow(
+    stage_a_rgb: np.ndarray,
+    stage_a_mask: np.ndarray,
+    body_pts: np.ndarray,
+    out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stage B: 流水式逐行 stretch。
+
+    Stage A 已经把衣服粗定位到身体区域（领口对齐 + bbox 缩放）。
+    本函数按"流水"语义逐行把衣服 fit 到身体轮廓：
+
+      - 对每个采样 y，求 body 轮廓左右边 (bL, bR) 和 cloth 轮廓左右边 (cL, cR)
+      - 算 s(y) = (bR - bL) / (cR - cL),  t(y) = bL - s * cL
+      - 在最上方衣服像素行锚定 s=1, t=0（领口不位移）
+      - 用 cubic spline 平滑 s(y), t(y)
+      - 对整张图做 cv2.remap：x_new = s(y)·x + t(y)
+
+    与 v3 TPS 控制点路径的关键差异：本方法用 **每行两个连续点**（密集、连续、
+    落在 silhouette 上）做 fit，目标是把布边 fit 到身轮廓——"按轮廓贴合"，
+    不是按稀疏语义点拉扯。袖子自然被压回躯干宽度（短袖 OK，长袖需 Step 2）。
+    """
+    H_out, W_out = out_shape
+
+    rows_with_cloth = np.where(stage_a_mask.any(axis=1))[0]
+    if len(rows_with_cloth) == 0:
+        return (
+            np.zeros((H_out, W_out, 3), dtype=np.uint8),
+            np.zeros((H_out, W_out), dtype=np.uint8),
+        )
+    top_y = float(rows_with_cloth[0])
+    body_bottom = float(body_pts[:, 1].max())
+
+    # 采样 y：从 top_y 到 body_bottom
+    n_samples = 30
+    ys_query = np.linspace(top_y, max(body_bottom, top_y + 1), n_samples)
+
+    body_left, body_right = _body_silhouette_per_row(body_pts, ys_query)
+    cloth_left, cloth_right = _cloth_silhouette_per_row(stage_a_mask, ys_query)
+
+    # 算 s(y), t(y)。cloth 没像素 或 body 单点（width=0）的行无效。
+    s = np.ones(n_samples, dtype=np.float64)
+    t = np.zeros(n_samples, dtype=np.float64)
+    valid = (
+        np.isfinite(body_left) & np.isfinite(body_right)
+        & (cloth_left >= 0) & (cloth_right > cloth_left)
+        & (body_right > body_left)
+    )
+    body_w = body_right - body_left
+    cloth_w = cloth_right - cloth_left
+    s[valid] = body_w[valid] / cloth_w[valid]
+    t[valid] = body_left[valid] - s[valid] * cloth_left[valid]
+
+    # 锚定 top_y：s=1, t=0（最上方衣服像素不位移，保留 Stage A 定位）
+    top_idx = 0                                # ys_query[0] == top_y
+    s[top_idx] = 1.0
+    t[top_idx] = 0.0
+    used = valid | (np.arange(n_samples) == top_idx)
+
+    ys_used = ys_query[used]
+    s_used = s[used]
+    t_used = t[used]
+
+    ys_all = np.arange(H_out, dtype=np.float64)
+
+    # body_pts 的 y 范围外不 warp（s=1, t=0）。原因：spline 在端点外会
+    # 外推出不稳定值（已观察到 qipao 下半身被画出"spline 尾巴"）。
+    body_top = float(body_pts[:, 1].min())
+    body_bot = float(body_pts[:, 1].max())
+    in_body = (ys_all >= body_top) & (ys_all <= body_bot)
+
+    s_full = np.ones(H_out, dtype=np.float64)
+    t_full = np.zeros(H_out, dtype=np.float64)
+
+    # 用 linear interp 而非 cubic spline：cubic spline 在端点附近因
+    # 边界条件会产生振荡（实测：qipao 顶部出现"spline 尾巴"把领口横向
+    # 拉到画外）。linear interp 不振荡，最多"折线感"；30 采样点足够密。
+    s_in = np.interp(ys_all[in_body], ys_used, s_used)
+    t_in = np.interp(ys_all[in_body], ys_used, t_used)
+
+    # 限制 s 范围，避免极端拉扯（V 领/细腰 → body 肩宽 ≈ 2.7x 会把花纹
+    # 拉变形；clamp 到 [0.7, 1.5] 让拉伸有界）。
+    s_in = np.clip(s_in, 0.7, 1.5)
+    s_full[in_body] = s_in
+    t_full[in_body] = t_in
+
+    # 构造 map_x: x_src = (x_out - t(y)) / s(y)
+    W_in = stage_a_rgb.shape[1]
+    grid_y, grid_x = np.mgrid[0:H_out, 0:W_out]
+    s_full_2d = s_full[:, np.newaxis]
+    t_full_2d = t_full[:, np.newaxis]
+    safe_s = np.where(np.abs(s_full_2d) > 1e-6, s_full_2d, 1.0)
+    valid_s = (np.abs(s_full_2d) > 1e-6) & np.isfinite(s_full_2d)
+    map_x = np.where(
+        valid_s,
+        (grid_x - t_full_2d) / safe_s,
+        grid_x.astype(np.float32),
+    ).astype(np.float32)
+    map_x = np.clip(map_x, 0, W_in - 1).astype(np.float32)
+    map_y = grid_y.astype(np.float32)
+
+    if used.sum() > 1:
+        s_min, s_max = float(s[used].min()), float(s[used].max())
+    else:
+        s_min = s_max = 1.0
+    logger.info(
+        "Stage B flow: top_y=%.0f body_bottom=%.0f samples=%d valid=%d "
+        "s_range=[%.3f, %.3f]",
+        top_y, body_bottom, n_samples, int(used.sum()), s_min, s_max,
+    )
+
+    warped_rgb = cv2.remap(
+        stage_a_rgb, map_x, map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    warped_mask = cv2.remap(
+        stage_a_mask, map_x, map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped_rgb, warped_mask
+
+
 def _warp_tps(
     clothing_rgb: np.ndarray,
     clothing_mask: np.ndarray,
@@ -301,10 +556,10 @@ def warp_clothing(
         out_shape: 输出图尺寸 (H, W)
         clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
         body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
-        method: ``"affine"``（默认）只做等比缩放+对齐；``"tps"`` 用 semantic_pairs
-            提供的语义对应点做薄板样条非线性形变。
-        semantic_pairs: (n, 2, 2) 数组，semantic_pairs[i, 0] 是衣服点、
-            semantic_pairs[i, 1] 是对应人体点。仅 method="tps" 时必填。
+        method: ``"affine"``（默认）只做 Stage A 仿射；``"flow"`` Stage A
+            + 流水式逐行 stretch；``"tps"`` 用 semantic_pairs 做薄板样条
+            非线性形变（已不推荐——见 _warp_tps 注释）。
+        semantic_pairs: (n, 2, 2) 数组，仅 method="tps" 时必填。
 
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
@@ -320,49 +575,25 @@ def warp_clothing(
             body_anchor=body_anchor,
         )
 
-    n = min(len(clothing_contour), len(body_contour))
-    src_pts = clothing_contour[:n].astype(np.float32)
-    dst_pts = body_contour[:n].astype(np.float32)
+    if method == "flow":
+        # Stage A 粗定位 → Stage B 流水式逐行 fit
+        stage_a_rgb, stage_a_mask = _warp_affine_stage_a(
+            clothing_rgb, clothing_mask,
+            clothing_contour, body_contour,
+            clothing_anchor=clothing_anchor,
+            body_anchor=body_anchor,
+            out_shape=out_shape,
+        )
+        return _warp_flow(stage_a_rgb, stage_a_mask, body_contour, out_shape)
 
-    H, W = out_shape
-
-    # 用外接矩形估算缩放（cover 身体区域）
-    sx_min, sy_min = src_pts[:, 0].min(), src_pts[:, 1].min()
-    sx_max, sy_max = src_pts[:, 0].max(), src_pts[:, 1].max()
-    dx_min, dy_min = dst_pts[:, 0].min(), dst_pts[:, 1].min()
-    dx_max, dy_max = dst_pts[:, 0].max(), dst_pts[:, 1].max()
-    src_w = max(sx_max - sx_min, 1)
-    src_h = max(sy_max - sy_min, 1)
-    dst_w = max(dx_max - dx_min, 1)
-    dst_h = max(dy_max - dy_min, 1)
-    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
-
-    # 锚点定位：衣服领口 → 人体脖子
-    if clothing_anchor is None:
-        clothing_anchor = (float(sx_min + sx_max) / 2, float(sy_min))
-    if body_anchor is None:
-        body_anchor = (float(dx_min + dx_max) / 2, float(dy_min))
-
-    cx, cy = clothing_anchor
-    bx, by = body_anchor
-    tx = bx - cx * scale
-    ty = by - cy * scale
-    M_affine = np.array([
-        [scale, 0, tx],
-        [0, scale, ty],
-    ], dtype=np.float32)
-
-    # 仿射 warp
-    warped_rgb = cv2.warpAffine(clothing_rgb, M_affine, (W, H),
-                                flags=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT,
-                                borderValue=(0, 0, 0))
-    warped_mask = cv2.warpAffine(clothing_mask, M_affine, (W, H),
-                                 flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_CONSTANT,
-                                 borderValue=0)
-
-    return warped_rgb, warped_mask
+    # 默认 affine：仅 Stage A
+    return _warp_affine_stage_a(
+        clothing_rgb, clothing_mask,
+        clothing_contour, body_contour,
+        clothing_anchor=clothing_anchor,
+        body_anchor=body_anchor,
+        out_shape=out_shape,
+    )
 
 
 def blend(
