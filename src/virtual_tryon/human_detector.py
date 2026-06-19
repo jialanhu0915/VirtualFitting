@@ -320,16 +320,22 @@ def body_region_contour(
     n_points: int = 30,
     expand_ratio: float = 0.05,
 ) -> np.ndarray:
-    """从 MediaPipe 关键点提取躯干区域轮廓。
+    """从 MediaPipe 关键点提取躯干 + 手臂区域轮廓。
 
     多边形按真实人体形状设计（旧 v3 版的形状有几何错误，会让流水式 fit
     出沙漏轮廓）：
     - 顶部 neck_top 在肩线以上（不再是平直肩线）
     - 腋下与肩同 x（不再向内凹——臂从此处开始离开躯干）
     - 髋部向外扩到外缘（MediaPipe hip 是关节中心，不是髋外缘）
+    - 腋下之后沿手臂外缘继续向下到腕（让长袖 fit 到手臂而非被压扁）
     - 底部仍是单点（不模拟腿）
 
-    顶点（顺时针）：neck_top → 左肩 → 左腋 → 左髋 → 底中 → 右髋 → 右腋 → 右肩。
+    顶点（顺时针，从 neck_top 沿左半身体到右半）：
+        neck_top → 左肩 → 左腋 → 左肘 → 左腕 → 底中 → 右腕 → 右肘 → 右腋 → 右肩
+
+    当 MediaPipe 缺少 wrist 关键点（手被裁出画外等），肘/腕顶点退回到
+    髋部位置，silhouette 在腋下后向内收到腰线——等价于无手臂的旧版
+    本，保证短袖/裁手场景不破坏。
 
     Args:
         kpts: MediaPipe / RobustHumanDetector 返回的 33 关键点。
@@ -345,11 +351,19 @@ def body_region_contour(
 
     ls_x, ls_y = kpts["left_shoulder"].x, kpts["left_shoulder"].y
     rs_x, rs_y = kpts["right_shoulder"].x, kpts["right_shoulder"].y
-    le_y = kpts["left_elbow"].y
-    re_y = kpts["right_elbow"].y
+    le_x, le_y = kpts["left_elbow"].x, kpts["left_elbow"].y
+    re_x, re_y = kpts["right_elbow"].x, kpts["right_elbow"].y
     lh_x, lh_y = kpts["left_hip"].x, kpts["left_hip"].y
     rh_x, rh_y = kpts["right_hip"].x, kpts["right_hip"].y
     nose_y = kpts["nose"].y
+
+    # 腕关键点可选：缺失时手臂段退化（肘/腕顶点在腋下-髋连线上）。
+    has_lw = "left_wrist" in kpts
+    has_rw = "right_wrist" in kpts
+    lw_x = kpts["left_wrist"].x if has_lw else None
+    lw_y = kpts["left_wrist"].y if has_lw else None
+    rw_x = kpts["right_wrist"].x if has_rw else None
+    rw_y = kpts["right_wrist"].y if has_rw else None
 
     cx = (ls_x + rs_x) / 2
     shoulder_y = (ls_y + rs_y) / 2
@@ -367,6 +381,8 @@ def body_region_contour(
     #   右肩/右髋（image 左侧）= 关节 x - pad
     shoulder_pad = 8      # 三角肌厚度
     hip_pad = 30          # 髋骨/臀部厚度
+    elbow_pad = 5         # 肘关节中心 → 上臂外缘
+    wrist_pad = 3         # 腕关节中心 → 前臂外缘
 
     lsh_x = ls_x + shoulder_pad
     rsh_x = rs_x - shoulder_pad
@@ -375,6 +391,32 @@ def body_region_contour(
     lhip_x = lh_x + hip_pad
     rhip_x = rh_x - hip_pad
 
+    # 肘/腕：直接用 MediaPipe 关键点 + pad。如果腕缺失则把肘/腕顶点都
+    # 放在腋下到髋连线上（约 60% 高度），让 silhouette 在腋下后向内收。
+    if has_lw:
+        lelbow_x = le_x + elbow_pad
+        lwrist_x = lw_x + wrist_pad
+        lwrist_y = lw_y
+    else:
+        # 退化：肘在腋下到髋的 60% y，腕在 90% y
+        leg_y = larmpit_y_l + (lh_y - larmpit_y_l) * 0.60
+        leg_y2 = larmpit_y_l + (lh_y - larmpit_y_l) * 0.90
+        lelbow_x = (larmpit_x + lhip_x) / 2
+        lwrist_x = (larmpit_x + lhip_x) / 2
+        lwrist_y = leg_y2
+        le_y = leg_y  # 同时改 le_y 不影响其他计算
+    if has_rw:
+        relbow_x = re_x - elbow_pad
+        rwrist_x = rw_x - wrist_pad
+        rwrist_y = rw_y
+    else:
+        reg_y = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.60
+        reg_y2 = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.90
+        relbow_x = (rarmpit_x + rhip_x) / 2
+        rwrist_x = (rarmpit_x + rhip_x) / 2
+        rwrist_y = reg_y2
+        re_y = reg_y
+
     bottom_y = max(lh_y, rh_y)
     bottom_x = (lhip_x + rhip_x) / 2
 
@@ -382,11 +424,13 @@ def body_region_contour(
         (cx, neck_top_y),       # 0  neck_top（肩线以上）
         (lsh_x, ls_y),          # 1  左肩外缘
         (larmpit_x, armpit_y_l),# 2  左腋下（与肩同 x）
-        (lhip_x, lh_y),         # 3  左髋外缘
-        (bottom_x, bottom_y),   # 4  底部中点（不模拟腿）
-        (rhip_x, rh_y),         # 5  右髋外缘
-        (rarmpit_x, armpit_y_r),# 6  右腋下
-        (rsh_x, rs_y),          # 7  右肩外缘
+        (lelbow_x, le_y),       # 3  左肘外缘
+        (lwrist_x, lwrist_y),   # 4  左腕外缘
+        (bottom_x, bottom_y),   # 5  底部中点（不模拟腿）
+        (rwrist_x, rwrist_y),   # 6  右腕外缘
+        (relbow_x, re_y),       # 7  右肘外缘
+        (rarmpit_x, armpit_y_r),# 8  右腋下
+        (rsh_x, rs_y),          # 9  右肩外缘
     ], dtype=np.float32)
 
     # 外扩 expand_ratio（防止 warp 后边缘露肉）
