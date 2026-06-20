@@ -171,6 +171,22 @@ def _region_silhouette_per_row(
         cloth_left[i] = float(np.argmax(row_cloth))
         cloth_right[i] = float(w - 1 - np.argmax(row_cloth[::-1]))
 
+    # 把 cloth silhouette 对 body_center 强制对称。
+    # 原因：qipao 这类衣服的斜襟 / 单边小 feature 在 silhouette 上是
+    # "左多 X px"，per-row fit 会把它当成真左边缘，s 拉伸后放大成
+    # 可见凸块。把 cloth_left/cloth_right 围绕 body_center 镜像成对称
+    # 后，per-row fit 走的就是真 silhouette（无单边 noise），凸块消失。
+    # dress 宽度保留，body-shape 适配（per-region + V 领保留）不受影响。
+    for i in range(len(ys)):
+        if cloth_left[i] < 0 or cloth_right[i] < 0:
+            continue
+        if not (np.isfinite(body_left[i]) and np.isfinite(body_right[i])):
+            continue
+        bc = (body_left[i] + body_right[i]) / 2.0
+        cw = cloth_right[i] - cloth_left[i]
+        cloth_left[i] = bc - cw / 2.0
+        cloth_right[i] = bc + cw / 2.0
+
     return body_left, body_right, cloth_left, cloth_right
 
 
