@@ -51,35 +51,55 @@ def run_one(person: Path, cloth: Path) -> Path:
 
 
 def make_contact_sheet() -> Path:
-    """3 行（人）× 4 列（衣）拼接 result.jpg。"""
+    """3 行（人）× 4 列（衣）拼接 result.jpg。
+
+    Cell 几何：每个 cell 高度固定（按源图最长边缩放），宽度按源图 aspect
+    ratio 等比算出。横向白边 padding 让 cell 居中。这样人物不会被横向
+    压扁。Cell 高度 = 500，按 768x1376 源图算 cell 宽度 = 500 * 0.558 ≈ 279。
+    """
     import cv2
     import numpy as np
-    rows = []
+    CELL_H = 500
+    cells = []
     for p in people:
-        cells = []
+        row_cells = []
         for c in clothes:
             out_dir = GRID / f"{p.stem}__{c.stem}"
             res = out_dir / "result.jpg"
             img = cv2.imread(str(res)) if res.exists() else None
             if img is None:
                 # 占位灰块
-                img = np.full((400, 300, 3), 64, dtype=np.uint8)
-                cv2.putText(img, "FAIL", (100, 200),
+                img = np.full((CELL_H, 300, 3), 64, dtype=np.uint8)
+                cv2.putText(img, "FAIL", (50, CELL_H // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            # 缩小到 300x400
-            img = cv2.resize(img, (300, 400))
-            # 标人 / 衣名
-            cv2.putText(img, c.stem, (5, 20),
+                row_cells.append(img)
+                continue
+            # 等比缩放到高度 CELL_H
+            h0, w0 = img.shape[:2]
+            scale = CELL_H / h0
+            new_w = int(round(w0 * scale))
+            img_r = cv2.resize(img, (new_w, CELL_H))
+            # 标衣名
+            cv2.putText(img_r, c.stem, (5, 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            cells.append(img)
-        row = np.hstack(cells)
+            row_cells.append(img_r)
+        # 行高度对齐到最高 cell（同一 cell 高度其实都相同）
+        max_w = max(c.shape[1] for c in row_cells)
+        padded = []
+        for c in row_cells:
+            if c.shape[1] < max_w:
+                pad = np.full((CELL_H, max_w - c.shape[1], 3), 0, dtype=np.uint8)
+                padded.append(np.hstack([c, pad]))
+            else:
+                padded.append(c)
+        row = np.hstack(padded)
         # 行左侧标人
         labeled = np.full((row.shape[0], 100, 3), 32, dtype=np.uint8)
-        cv2.putText(labeled, p.stem, (10, 200),
+        cv2.putText(labeled, p.stem, (10, CELL_H // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        rows.append(np.hstack([labeled, row]))
+        cells.append(np.hstack([labeled, row]))
 
-    sheet = np.vstack(rows)
+    sheet = np.vstack(cells)
     out = GRID / "contact_sheet.jpg"
     cv2.imwrite(str(out), sheet)
     print(f"\ncontact sheet: {out}  shape={sheet.shape}")
