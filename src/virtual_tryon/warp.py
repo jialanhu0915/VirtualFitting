@@ -229,10 +229,11 @@ def _warp_affine_stage_a(
     src_h = max(sy_max - sy_min, 1)
     dst_w = max(dx_max - dx_min, 1)
     dst_h = max(dy_max - dy_min, 1)
-    # 各向异性 scale：宽/高独立，避免高领/帽衫顶部被 bbox 高度比裁掉，
-    # 也避免 height-dominated 时宽度被过度拉伸。
-    sx = dst_w / src_w * 1.05
-    sy = dst_h / src_h * 1.05
+    # 各向同性 scale + max：衣服按"不可变形的整体"等比缩放，
+    # max 保证衣服在两个维度都不小于身体 bbox——满足"不压缩不变
+    # 性、自然下铺"的设计要求。旗袍等高>宽的衣服不会被 anisotropic
+    # 拉成宽>高。1.05 余量让衣服略大于身体 bbox，避免边缘露肉。
+    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
 
     # 肩线中点兜底：若 main.py 没传，用 bbox 顶部中点（应只在测试场景
     # 触发，run 子命令一定会传 shoulder keypoint）。
@@ -243,16 +244,16 @@ def _warp_affine_stage_a(
 
     cx, cy = clothing_anchor
     bx, by = body_anchor
-    tx = bx - cx * sx
-    ty = by - cy * sy
+    tx = bx - cx * scale
+    ty = by - cy * scale
     logger.info(
-        "Stage A affine: sx=%.4f sy=%.4f  tx=%.1f  ty=%.1f  "
+        "Stage A affine: scale=%.4f  tx=%.1f  ty=%.1f  "
         "(clothing_shoulder=(%.0f,%.0f) → body_shoulder=(%.0f,%.0f))",
-        sx, sy, tx, ty, cx, cy, bx, by,
+        scale, tx, ty, cx, cy, bx, by,
     )
     M_aff = np.array([
-        [sx, 0, tx],
-        [0, sy, ty],
+        [scale, 0, tx],
+        [0, scale, ty],
     ], dtype=np.float32)
 
     warped_rgb = cv2.warpAffine(
