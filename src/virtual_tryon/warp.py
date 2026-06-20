@@ -182,13 +182,17 @@ def _warp_affine_stage_a(
     clothing_anchor: tuple[float, float] | None,
     body_anchor: tuple[float, float] | None,
     out_shape: tuple[int, int],
+    clothing_shoulder_w: float | None = None,
+    body_shoulder_w: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Stage A: 仿射粗定位（按"肩线"做对齐基准）。
 
     用户原话："让两个 mask 的上方的边缘尽可能贴合，以长度更长的肩部
     的线作为对齐"——不用衣领 anchor。Stage A 接收 clothing_anchor
     和 body_anchor 作为"肩线中点"：(cx, cy) = 服装 / 人体肩线中心，
-    scale 由 bbox 兜底（保证衣服覆盖身体）。
+    scale 由 bbox 兜底 + cap=1.10 防止紧身衣在宽体上被过度放大（如
+    qipao 在 image3 人上 1.63x）。cloth/body_shoulder_w 参数保留 API
+    以备后续 garment-type 感知，但当前不参与 scale 计算。
 
     旧版用衣领 anchor 失败的原因：
     - clothing 端 anchor 是 mask 顶中点 → image3 衣架钩子、image1
@@ -229,11 +233,14 @@ def _warp_affine_stage_a(
     src_h = max(sy_max - sy_min, 1)
     dst_w = max(dx_max - dx_min, 1)
     dst_h = max(dy_max - dy_min, 1)
-    # 各向同性 scale + max：衣服按"不可变形的整体"等比缩放，
-    # max 保证衣服在两个维度都不小于身体 bbox——满足"不压缩不变
-    # 性、自然下铺"的设计要求。旗袍等高>宽的衣服不会被 anisotropic
-    # 拉成宽>高。1.05 余量让衣服略大于身体 bbox，避免边缘露肉。
-    scale = max(dst_w / src_w, dst_h / src_h) * 1.05
+    # 各向同性 scale：衣服按"不可变形的整体"等比缩放，max 保证两个
+    # 维度都不小于身体 bbox。1.05 余量让衣服略大于身体 bbox，避免
+    # 边缘露肉。cap=1.10 防止紧身衣（qipao 这种 bbox 紧贴的）在宽体
+    # 上算出 1.6x+ 的过度放大（qipao 在 image3 人上从 1.63→1.10）。
+    # shoulder_w 参数当前不参与 scale 计算（保留以备后续 garment-type
+    # 感知时用），但 anchor 仍按肩线对齐。
+    _ = (clothing_shoulder_w, body_shoulder_w)  # 保留 API 兼容
+    scale = min(max(dst_w / src_w, dst_h / src_h) * 1.05, 1.10)
 
     # 肩线中点兜底：若 main.py 没传，用 bbox 顶部中点（应只在测试场景
     # 触发，run 子命令一定会传 shoulder keypoint）。
@@ -248,8 +255,11 @@ def _warp_affine_stage_a(
     ty = by - cy * scale
     logger.info(
         "Stage A affine: scale=%.4f  tx=%.1f  ty=%.1f  "
-        "(clothing_shoulder=(%.0f,%.0f) → body_shoulder=(%.0f,%.0f))",
-        scale, tx, ty, cx, cy, bx, by,
+        "(src=%s shoulder=%.1f → dst=%.1f, clothing=(%.0f,%.0f) → body=(%.0f,%.0f))",
+        scale, tx, ty,
+        "ratio" if (clothing_shoulder_w and body_shoulder_w) else "bbox",
+        clothing_shoulder_w or 0.0, body_shoulder_w or 0.0,
+        cx, cy, bx, by,
     )
     M_aff = np.array([
         [scale, 0, tx],
@@ -514,6 +524,8 @@ def warp_clothing(
     out_shape: tuple[int, int],
     clothing_anchor: tuple[float, float] | None = None,
     body_anchor: tuple[float, float] | None = None,
+    clothing_shoulder_w: float | None = None,
+    body_shoulder_w: float | None = None,
     method: str = "flow",
 ) -> tuple[np.ndarray, np.ndarray]:
     """将衣服 RGB 图和 mask 一起 warp 到人体坐标系。
@@ -526,6 +538,9 @@ def warp_clothing(
         out_shape: 输出图尺寸 (H, W)
         clothing_anchor: 衣服领口锚点 (x, y)，默认 None=用轮廓顶部中点
         body_anchor: 人体脖子锚点 (x, y)，默认 None=用 body_contour 顶部中点
+        clothing_shoulder_w: 衣服左右肩点 x 距离（像素）。当前未参与
+            scale 计算，保留 API 以备后续 garment-type 感知时启用。
+        body_shoulder_w: 人体左右肩点 x 距离（像素）。同上。
         method: ``"flow"``（默认）Stage A 仿射 + Stage B 流水式逐行 fit
             （含长袖分块）；``"affine"`` 只做 Stage A 仿射（无流水式 fit）。
 
@@ -541,6 +556,8 @@ def warp_clothing(
             clothing_anchor=clothing_anchor,
             body_anchor=body_anchor,
             out_shape=out_shape,
+            clothing_shoulder_w=clothing_shoulder_w,
+            body_shoulder_w=body_shoulder_w,
         )
 
     # 默认 flow：Stage A 粗定位 + Stage B 流水式逐行 fit
@@ -550,6 +567,8 @@ def warp_clothing(
         clothing_anchor=clothing_anchor,
         body_anchor=body_anchor,
         out_shape=out_shape,
+        clothing_shoulder_w=clothing_shoulder_w,
+        body_shoulder_w=body_shoulder_w,
     )
     return _warp_flow(stage_a_rgb, stage_a_mask, body_contour, out_shape)
 

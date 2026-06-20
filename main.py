@@ -179,6 +179,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     brs_y = float(human_kpts["right_shoulder"].y)
     body_anchor = ((bls_x + brs_x) / 2, (bls_y + brs_y) / 2)
 
+    # 肩宽比：衣服左右肩 x 距离 / 人体左右肩 x 距离。
+    # 物理意义明确，不受衣服图 padding 影响；同一件衣服在
+    # 不同人身上 scale 自然不同（宽肩的人衣服放大，窄肩的缩小），
+    # 但同一衣服跨人变化幅度比 bbox-based 方案小一个量级。
+    cloth_shoulder_w = abs(crs_x - cls_x)
+    body_shoulder_w = abs(brs_x - bls_x)
+
     # 4. 变形（领口 → 脖子锚定）
     logger.info("正在进行 %s 变形（领口→脖子锚定）...", args.warp_method)
 
@@ -187,6 +194,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         out_shape=person_img.shape[:2],
         clothing_anchor=cloth_anchor,
         body_anchor=body_anchor,
+        clothing_shoulder_w=cloth_shoulder_w,
+        body_shoulder_w=body_shoulder_w,
         method=args.warp_method,
     )
 
