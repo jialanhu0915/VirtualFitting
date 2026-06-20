@@ -57,30 +57,26 @@ def _build_body_regions(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """基于 body_pts 顶点构造 3 个区域 mask（躯干/左袖/右袖）。
 
-    body_pts 顶点顺序（10 点 arm-aware）：
-        0 neck_top, 1 lsh, 2 larmpit, 3 lelbow, 4 lwrist,
-        5 bottom_center, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
+    注意：上游调用方传入的是弧长重采样后的 30 点轮廓，不是 10 顶点的
+    arm-aware polygon——顶点索引没有语义含义。本函数改用 x/y 极值 +
+    分位数启发式把像素划入三个区域，**不**假设顶点顺序。
 
-    区域：
-      躯干: neck_top → lsh(顶点1) → lhip line 到底中 → rhip line 到 rsh(顶点9)
-      左袖: 顶点 1-4 之间的"袖子带"（肩外 → 腋 → 腕内侧 → 腕外）
-      右袖: 镜像
+    启发式：
+      躯干: x 落在 [x_min+20%, x_min+80%] 之间且 y 落在 body_pts y 范围内。
+      左袖: x ≥ torso_x_hi 且 y 落在 [5%-分位, 85%-分位] 之间（图像右侧）。
+      右袖: x ≤ torso_x_lo 且 y 同上（图像左侧）。
+      袖子外缘按行夹到 body_pts silhouette，避免把身体外的远端 cloth 算进来。
 
     Returns:
         (mask_torso, mask_lsleeve, mask_rsleeve) — 三个 (H, W) bool 数组。
-        同一像素可能被多个 mask 覆盖（袖子/躯干交接处）；用 np.logical_or
-        累加，最终优先级：lsleeve > rsleeve > torso。
+        同一像素可能被多个 mask 覆盖；_warp_flow 装配 region_id 时优先级
+        为 lsleeve > rsleeve > torso。
     """
     H, W = out_shape
-    # body_pts 是采样后的（n_points 个），不是 10 个原顶点——不能直接用
-    # "第 1 个 = lsh"这种假设。改用极值法：
-
     pts = body_pts
     x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
     y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
 
-    # 区域 1（躯干）：用 x 的"中间 60%" 作为躯干，y 范围 = 整个 body
-    # （手臂外缘 x 偏离躯干 > 30px 才算袖子，所以袖子 = 身体外侧 20%）
     torso_x_lo = x_min + 0.20 * (x_max - x_min)
     torso_x_hi = x_min + 0.80 * (x_max - x_min)
     yy, xx = np.mgrid[0:H, 0:W]
@@ -88,10 +84,12 @@ def _build_body_regions(
         & (yy >= y_min) & (yy <= y_max)
 
     # 区域 2/3（袖子）：取身体 x 外侧 22% 范围。y 范围 = 腋下到腕。
-    # 用 body_pts y 分布的 25% 和 95% 分位近似"腋下"和"腕"。
+    # 用 body_pts y 分布的 5% 和 85% 分位近似"腋下"和"腕"。原 30%/95%
+    # 对 10 顶点 arm-aware polygon 偏高，把上臂漏到躯干里——降到这里接近
+    # 实际解剖学位置。
     ys_sorted = np.sort(pts[:, 1])
-    armpit_y = float(ys_sorted[int(len(ys_sorted) * 0.30)])
-    wrist_y = float(ys_sorted[int(len(ys_sorted) * 0.95)])
+    armpit_y = float(ys_sorted[int(len(ys_sorted) * 0.05)])
+    wrist_y = float(ys_sorted[int(len(ys_sorted) * 0.85)])
 
     # 左袖：图像坐标右侧（x 大），x >= torso_x_hi
     mask_lsleeve = (xx >= torso_x_hi) \
@@ -231,6 +229,10 @@ def _warp_affine_stage_a(
     src_h = max(sy_max - sy_min, 1)
     dst_w = max(dx_max - dx_min, 1)
     dst_h = max(dy_max - dy_min, 1)
+    # 各向同性 scale + max：衣服按"不可变形的整体"等比缩放，
+    # max 保证衣服在两个维度都不小于身体 bbox——满足"不压缩不变
+    # 性、自然下铺"的设计要求。旗袍等高>宽的衣服不会被 anisotropic
+    # 拉成宽>高。1.05 余量让衣服略大于身体 bbox，避免边缘露肉。
     scale = max(dst_w / src_w, dst_h / src_h) * 1.05
 
     # 肩线中点兜底：若 main.py 没传，用 bbox 顶部中点（应只在测试场景
@@ -367,7 +369,8 @@ def _warp_flow(
         if name != "torso":
             region_valid[name] = valid_r | (np.arange(n_samples) == 0)
             continue
-        # 50/50 平滑过渡（同 _warp_flow 旧逻辑）
+        # samples 1..V_NECK_SAMPLES-1 从 (1.0, 0.0) 线性插值到
+        # (s_trans_raw, t_trans_raw)，消除单点中值的硬阶跃。
         if V_NECK_SAMPLES < n_samples and bool(valid_r[V_NECK_SAMPLES]):
             s_trans_raw = float(s_r[V_NECK_SAMPLES])
             t_trans_raw = float(t_r[V_NECK_SAMPLES])
@@ -375,11 +378,9 @@ def _warp_flow(
             s_trans_raw = 1.0
             t_trans_raw = 0.0
         for i in range(1, V_NECK_SAMPLES):
-            s_r[i] = 1.0
-            t_r[i] = 0.0
-        if V_NECK_SAMPLES < n_samples:
-            s_r[V_NECK_SAMPLES] = 0.5 + 0.5 * s_trans_raw
-            t_r[V_NECK_SAMPLES] = 0.5 * t_trans_raw
+            alpha = i / V_NECK_SAMPLES  # 0 → 1 跨 V_NECK_SAMPLES 段
+            s_r[i] = (1.0 - alpha) * 1.0 + alpha * s_trans_raw
+            t_r[i] = (1.0 - alpha) * 0.0 + alpha * t_trans_raw
         region_valid[name] = valid_r | (np.arange(n_samples) == 0)
 
     # 限制 s 范围到 [0.7, 1.5]
@@ -420,29 +421,52 @@ def _warp_flow(
     # 用 lookup 形式
     s_map = np.ones((H_out, W_out), dtype=np.float32)
     t_map = np.zeros((H_out, W_out), dtype=np.float32)
-    s_map[region_id == 0] = s_per_region["torso"][region_id == 0][:, np.newaxis] \
-        if False else np.broadcast_to(
-            s_per_region["torso"][:, np.newaxis], (H_out, W_out)
-        )[region_id == 0]
-    t_map[region_id == 0] = np.broadcast_to(
-        t_per_region["torso"][:, np.newaxis], (H_out, W_out)
-    )[region_id == 0]
-    s_map[region_id == 1] = np.broadcast_to(
-        s_per_region["lsleeve"][:, np.newaxis], (H_out, W_out)
-    )[region_id == 1]
-    t_map[region_id == 1] = np.broadcast_to(
-        t_per_region["lsleeve"][:, np.newaxis], (H_out, W_out)
-    )[region_id == 1]
-    s_map[region_id == 2] = np.broadcast_to(
-        s_per_region["rsleeve"][:, np.newaxis], (H_out, W_out)
-    )[region_id == 2]
-    t_map[region_id == 2] = np.broadcast_to(
-        t_per_region["rsleeve"][:, np.newaxis], (H_out, W_out)
-    )[region_id == 2]
+    for rid, (name, _) in enumerate(region_masks):
+        sel = region_id == rid
+        s_map[sel] = np.broadcast_to(
+            s_per_region[name][:, np.newaxis], (H_out, W_out)
+        )[sel]
+        t_map[sel] = np.broadcast_to(
+            t_per_region[name][:, np.newaxis], (H_out, W_out)
+        )[sel]
 
     # 默认（region_id == -1）: s=1, t=0（不变）
     s_map[region_id == -1] = 1.0
     t_map[region_id == -1] = 0.0
+
+    # region 边界羽化 N=3 像素：在 torso/sleeve 拼接列附近做 cosine
+    # 渐变，避免 s_map 硬阶跃在 map_x 上产生垂直接缝。
+    # torso_x_hi/lo 与 _build_body_regions 用的公式相同（不重提，返回
+    # 不扩散这俩内部常数）。
+    x_min = float(body_pts[:, 0].min())
+    x_max = float(body_pts[:, 0].max())
+    torso_x_hi = x_min + 0.80 * (x_max - x_min)
+    torso_x_lo = x_min + 0.20 * (x_max - x_min)
+    FEATHER_PX = 3
+    if FEATHER_PX > 0:
+        for boundary_x in (torso_x_hi, torso_x_lo):
+            x_lo = max(0, int(round(boundary_x - FEATHER_PX)))
+            x_hi = min(W_out - 1, int(round(boundary_x + FEATHER_PX)))
+            if x_lo > x_hi:
+                continue
+            xs = np.arange(x_lo, x_hi + 1, dtype=np.float32)
+            alpha_1d = np.clip(
+                (1.0 - np.cos(np.pi * (xs - boundary_x) / FEATHER_PX)) / 2.0,
+                0.0, 1.0,
+            )
+            rid_left = int(region_id[:, max(x_lo, 0)].mean()) if x_lo > 0 else int(region_id[:, x_lo + 1].mean())
+            rid_right = int(region_id[:, min(x_hi, W_out - 1)].mean()) if x_hi < W_out - 1 else int(region_id[:, x_hi - 1].mean())
+            if rid_left == rid_right or rid_left < 0 or rid_right < 0:
+                continue
+            alpha_2d = np.broadcast_to(alpha_1d[np.newaxis, :], (H_out, len(xs)))
+            s_left_col = s_per_region[region_masks[rid_left][0]][:, np.newaxis]
+            s_right_col = s_per_region[region_masks[rid_right][0]][:, np.newaxis]
+            t_left_col = t_per_region[region_masks[rid_left][0]][:, np.newaxis]
+            t_right_col = t_per_region[region_masks[rid_right][0]][:, np.newaxis]
+            s_feathered = (1.0 - alpha_2d) * s_left_col + alpha_2d * s_right_col
+            t_feathered = (1.0 - alpha_2d) * t_left_col + alpha_2d * t_right_col
+            s_map[:, x_lo:x_hi + 1] = s_feathered
+            t_map[:, x_lo:x_hi + 1] = t_feathered
 
     safe_s = np.where(np.abs(s_map) > 1e-6, s_map, 1.0)
     valid_s = (np.abs(s_map) > 1e-6) & np.isfinite(s_map)
@@ -508,6 +532,8 @@ def warp_clothing(
     Returns:
         warped_rgb, warped_mask — 都对齐到 out_shape
     """
+    if method not in ("affine", "flow"):
+        raise ValueError(f"method must be 'affine' or 'flow'; got {method!r}")
     if method == "affine":
         return _warp_affine_stage_a(
             clothing_rgb, clothing_mask,
