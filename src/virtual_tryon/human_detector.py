@@ -360,10 +360,6 @@ def body_region_contour(
     # 腕关键点可选：缺失时手臂段退化（肘/腕顶点在腋下-髋连线上）。
     has_lw = "left_wrist" in kpts
     has_rw = "right_wrist" in kpts
-    lw_x = kpts["left_wrist"].x if has_lw else None
-    lw_y = kpts["left_wrist"].y if has_lw else None
-    rw_x = kpts["right_wrist"].x if has_rw else None
-    rw_y = kpts["right_wrist"].y if has_rw else None
 
     cx = (ls_x + rs_x) / 2
     shoulder_y = (ls_y + rs_y) / 2
@@ -395,25 +391,26 @@ def body_region_contour(
     # 放在腋下到髋连线上（约 60% 高度），让 silhouette 在腋下后向内收。
     if has_lw:
         lelbow_x = le_x + elbow_pad
-        lwrist_x = lw_x + wrist_pad
-        lwrist_y = lw_y
+        lwrist_x = kpts["left_wrist"].x + wrist_pad
+        lwrist_y = kpts["left_wrist"].y
     else:
-        # 退化：肘在腋下到髋的 60% y，腕在 90% y
-        leg_y = larmpit_y_l + (lh_y - larmpit_y_l) * 0.60
-        leg_y2 = larmpit_y_l + (lh_y - larmpit_y_l) * 0.90
-        lelbow_x = (larmpit_x + lhip_x) / 2
-        lwrist_x = (larmpit_x + lhip_x) / 2
+        # 退化：腕缺失时肘/腕 y 仍按腋下→髋连线比例放，但 x 沿
+        # (腋下, 髋) 线性插值，保证手腕略窄于肘部，避免"棍状手臂"零锥度。
+        leg_y = armpit_y_l + (lh_y - armpit_y_l) * 0.60
+        leg_y2 = armpit_y_l + (lh_y - armpit_y_l) * 0.90
+        lelbow_x = larmpit_x + (lhip_x - larmpit_x) * 0.50
+        lwrist_x = larmpit_x + (lhip_x - larmpit_x) * 0.65
         lwrist_y = leg_y2
         le_y = leg_y  # 同时改 le_y 不影响其他计算
     if has_rw:
         relbow_x = re_x - elbow_pad
-        rwrist_x = rw_x - wrist_pad
-        rwrist_y = rw_y
+        rwrist_x = kpts["right_wrist"].x - wrist_pad
+        rwrist_y = kpts["right_wrist"].y
     else:
-        reg_y = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.60
-        reg_y2 = rarmpit_y_r + (rh_y - rarmpit_y_r) * 0.90
-        relbow_x = (rarmpit_x + rhip_x) / 2
-        rwrist_x = (rarmpit_x + rhip_x) / 2
+        reg_y = armpit_y_r + (rh_y - armpit_y_r) * 0.60
+        reg_y2 = armpit_y_r + (rh_y - armpit_y_r) * 0.90
+        relbow_x = rarmpit_x + (rhip_x - rarmpit_x) * 0.50
+        rwrist_x = rarmpit_x + (rhip_x - rarmpit_x) * 0.65
         rwrist_y = reg_y2
         re_y = reg_y
 
@@ -433,11 +430,12 @@ def body_region_contour(
         (rsh_x, rs_y),          # 9  右肩外缘
     ], dtype=np.float32)
 
-    # 外扩 expand_ratio（防止 warp 后边缘露肉）
+    # 外扩 expand_ratio（防止 warp 后边缘露肉）。跳过 vertex 0（neck_top）
+    # ——它合成的位于肩线之上，外推会把 silhouette 顶部人为撑宽。
     if expand_ratio > 0:
         cx_v = verts[:, 0].mean()
         cy_v = verts[:, 1].mean()
-        for i in range(len(verts)):
+        for i in range(1, len(verts)):
             dx, dy = verts[i][0] - cx_v, verts[i][1] - cy_v
             dist = np.sqrt(dx * dx + dy * dy) + 1e-6
             verts[i][0] += dx / dist * expand_ratio * (abs(dx) + abs(dy))
