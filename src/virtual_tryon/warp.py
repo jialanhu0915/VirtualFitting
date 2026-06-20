@@ -57,30 +57,26 @@ def _build_body_regions(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """基于 body_pts 顶点构造 3 个区域 mask（躯干/左袖/右袖）。
 
-    body_pts 顶点顺序（10 点 arm-aware）：
-        0 neck_top, 1 lsh, 2 larmpit, 3 lelbow, 4 lwrist,
-        5 bottom_center, 6 rwrist, 7 relbow, 8 rarmpit, 9 rsh
+    注意：上游调用方传入的是弧长重采样后的 30 点轮廓，不是 10 顶点的
+    arm-aware polygon——顶点索引没有语义含义。本函数改用 x/y 极值 +
+    分位数启发式把像素划入三个区域，**不**假设顶点顺序。
 
-    区域：
-      躯干: neck_top → lsh(顶点1) → lhip line 到底中 → rhip line 到 rsh(顶点9)
-      左袖: 顶点 1-4 之间的"袖子带"（肩外 → 腋 → 腕内侧 → 腕外）
-      右袖: 镜像
+    启发式：
+      躯干: x 落在 [x_min+20%, x_min+80%] 之间且 y 落在 body_pts y 范围内。
+      左袖: x ≥ torso_x_hi 且 y 落在 [5%-分位, 85%-分位] 之间（图像右侧）。
+      右袖: x ≤ torso_x_lo 且 y 同上（图像左侧）。
+      袖子外缘按行夹到 body_pts silhouette，避免把身体外的远端 cloth 算进来。
 
     Returns:
         (mask_torso, mask_lsleeve, mask_rsleeve) — 三个 (H, W) bool 数组。
-        同一像素可能被多个 mask 覆盖（袖子/躯干交接处）；用 np.logical_or
-        累加，最终优先级：lsleeve > rsleeve > torso。
+        同一像素可能被多个 mask 覆盖；_warp_flow 装配 region_id 时优先级
+        为 lsleeve > rsleeve > torso。
     """
     H, W = out_shape
-    # body_pts 是采样后的（n_points 个），不是 10 个原顶点——不能直接用
-    # "第 1 个 = lsh"这种假设。改用极值法：
-
     pts = body_pts
     x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
     y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
 
-    # 区域 1（躯干）：用 x 的"中间 60%" 作为躯干，y 范围 = 整个 body
-    # （手臂外缘 x 偏离躯干 > 30px 才算袖子，所以袖子 = 身体外侧 20%）
     torso_x_lo = x_min + 0.20 * (x_max - x_min)
     torso_x_hi = x_min + 0.80 * (x_max - x_min)
     yy, xx = np.mgrid[0:H, 0:W]
